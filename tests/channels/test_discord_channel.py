@@ -367,12 +367,12 @@ async def test_on_message_includes_thread_history_context() -> None:
 
 
 def test_discord_config_allows_numeric_allow_from() -> None:
-    config = DiscordConfig(model_validate={"allowFrom": [123, "456"]})
+    config = DiscordConfig.model_validate({"allowFrom": [123, "456"]})
     assert config.allow_from == ["123", "456"]
 
 
 def test_discord_config_allows_history_fetch_limit_alias() -> None:
-    config = DiscordConfig(model_validate={"historyFetchLimit": 50})
+    config = DiscordConfig.model_validate({"historyFetchLimit": 50})
     assert config.history_fetch_limit == 50
 
 
@@ -690,6 +690,27 @@ async def test_client_send_outbound_chunks_text_replies_and_uploads_files(tmp_pa
     assert target.sent_payloads[0]["reference"].id == 55
     assert target.sent_payloads[1]["content"] == "a" * 2000
     assert target.sent_payloads[2]["content"] == "a" * 100
+
+
+@pytest.mark.asyncio
+async def test_client_send_outbound_defaults_to_reply_to_incoming_message() -> None:
+    owner = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+    client = DiscordBotClient(owner, intents=discord.Intents.none())
+    target = _FakeChannel(channel_id=123)
+    client.get_channel = lambda channel_id: target if channel_id == 123 else None  # type: ignore[method-assign]
+
+    await client.send_outbound(
+        OutboundMessage(
+            channel="discord",
+            chat_id="123",
+            content="hello",
+            metadata={"message_id": "55"},
+        )
+    )
+
+    assert len(target.sent_payloads) == 1
+    assert target.sent_payloads[0]["content"] == "hello"
+    assert target.sent_payloads[0]["reference"].id == 55
 
 
 @pytest.mark.asyncio

@@ -39,14 +39,14 @@ class DiscordConfig(Base):
 
     enabled: bool = False
     token: str = ""
-    bot_id: str = ""
-    allow_from: list[str] = Field(default_factory=list)
+    bot_id: str | None = None
+    allow_from: list[str] = Field(default_factory=list, alias="allowFrom")
     intents: int = 37377
     group_policy: Literal["mention", "open"] = "mention"
     read_receipt_emoji: str = "👀"
     working_emoji: str = "🔧"
     working_emoji_delay: float = 2.0
-    history_fetch_limit: int = 200
+    history_fetch_limit: int = Field(default=50, alias="historyFetchLimit")
 
     @field_validator("allow_from", mode="before")
     @classmethod
@@ -172,7 +172,11 @@ if DISCORD_AVAILABLE:
                     logger.warning("Discord channel {} unavailable: {}", msg.chat_id, e)
                     return
 
-            reference, mention_settings = self._build_reply_context(channel, msg.reply_to)
+            reply_to = msg.reply_to
+            if reply_to is None and msg.metadata:
+                reply_to = msg.metadata.get("message_id")
+
+            reference, mention_settings = self._build_reply_context(channel, reply_to)
             sent_media = False
             failed_media: list[str] = []
 
@@ -349,7 +353,7 @@ class DiscordChannel(BaseChannel):
         media_paths, attachment_markers = await self._download_attachments(message.attachments)
         full_content = self._compose_inbound_content(content, attachment_markers)
         metadata = self._build_inbound_metadata(message)
-        metadata["bot_id"] = self._bot_user_id or self.config.bot_id
+        metadata["bot_id"] = self._bot_user_id or self.config.bot_id or None
 
         # Fetch thread history context for the first pass in this conversation.
         history_lines = await self._fetch_thread_history(message)
