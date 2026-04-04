@@ -283,7 +283,36 @@ async def test_on_message_accepts_allowlisted_dm() -> None:
 
     assert len(handled) == 1
     assert handled[0]["chat_id"] == "456"
-    assert handled[0]["metadata"] == {"message_id": "789", "guild_id": None, "reply_to": None}
+    assert handled[0]["metadata"] == {
+        "message_id": "789",
+        "guild_id": None,
+        "reply_to": None,
+        "bot_id": None,
+    }
+
+
+def test_discord_config_allows_numeric_allow_from() -> None:
+    config = DiscordConfig(model_validate={"allowFrom": [123, "456"]})
+    assert config.allow_from == ["123", "456"]
+
+
+@pytest.mark.asyncio
+async def test_on_message_includes_bot_id_metadata() -> None:
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, allow_from=["*"], bot_id="1489835510175105115"),
+        MessageBus(),
+    )
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+
+    await channel._on_message(_make_message(author_id=123, channel_id=456, message_id=789))
+
+    assert len(handled) == 1
+    assert handled[0]["metadata"]["bot_id"] == "1489835510175105115"
 
 
 @pytest.mark.asyncio
@@ -452,6 +481,7 @@ async def test_slash_new_forwards_when_user_is_allowlisted() -> None:
     assert handled[0]["chat_id"] == "456"
     assert handled[0]["metadata"]["interaction_id"] == "321"
     assert handled[0]["metadata"]["is_slash_command"] is True
+    assert handled[0]["metadata"]["bot_id"] is None
 
 
 @pytest.mark.asyncio

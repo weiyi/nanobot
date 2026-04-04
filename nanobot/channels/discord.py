@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from loguru import logger
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -39,12 +39,22 @@ class DiscordConfig(Base):
 
     enabled: bool = False
     token: str = ""
+    bot_id: str = ""
     allow_from: list[str] = Field(default_factory=list)
     intents: int = 37377
     group_policy: Literal["mention", "open"] = "mention"
     read_receipt_emoji: str = "👀"
     working_emoji: str = "🔧"
     working_emoji_delay: float = 2.0
+
+    @field_validator("allow_from", mode="before")
+    @classmethod
+    def _normalize_allow_from(cls, value):
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        return [str(value)]
 
 
 if DISCORD_AVAILABLE:
@@ -60,6 +70,8 @@ if DISCORD_AVAILABLE:
 
         async def on_ready(self) -> None:
             self._channel._bot_user_id = str(self.user.id) if self.user else None
+            if self._channel._bot_user_id and not self._channel.config.bot_id:
+                self._channel.config.bot_id = self._channel._bot_user_id
             logger.info("Discord bot connected as user {}", self._channel._bot_user_id)
             try:
                 synced = await self.tree.sync()
@@ -105,6 +117,7 @@ if DISCORD_AVAILABLE:
                     "interaction_id": str(interaction.id),
                     "guild_id": str(interaction.guild_id) if interaction.guild_id else None,
                     "is_slash_command": True,
+                    "bot_id": self._channel._bot_user_id or self._channel.config.bot_id,
                 },
             )
 
@@ -335,6 +348,7 @@ class DiscordChannel(BaseChannel):
         media_paths, attachment_markers = await self._download_attachments(message.attachments)
         full_content = self._compose_inbound_content(content, attachment_markers)
         metadata = self._build_inbound_metadata(message)
+        metadata["bot_id"] = self._bot_user_id or self.config.bot_id
 
         await self._start_typing(message.channel)
 
@@ -436,7 +450,7 @@ class DiscordChannel(BaseChannel):
             return True
 
         if self.config.group_policy == "mention":
-            bot_user_id = self._bot_user_id
+            bot_user_id = self._bot_user_id or self.config.bot_id
             if bot_user_id is None:
                 logger.debug("Discord message in {} ignored (bot identity unavailable)", message.channel.id)
                 return False

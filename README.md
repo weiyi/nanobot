@@ -381,6 +381,7 @@ If you prefer to configure manually, add the following to `~/.nanobot/config.jso
     "discord": {
       "enabled": true,
       "token": "YOUR_BOT_TOKEN",
+      "botId": "YOUR_DISCORD_BOT_USER_ID",
       "allowFrom": ["YOUR_USER_ID"],
       "groupPolicy": "mention"
     }
