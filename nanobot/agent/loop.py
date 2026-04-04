@@ -526,7 +526,10 @@ class AgentLoop:
             current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(
                 history=history,
-                current_message=msg.content, channel=channel, chat_id=chat_id,
+                current_message=msg.content,
+                channel=channel,
+                chat_id=chat_id,
+                bot_id=msg.metadata.get("bot_id") if msg.metadata else None,
                 current_role=current_role,
             )
             final_content, _, all_msgs = await self._run_agent_loop(
@@ -566,7 +569,9 @@ class AgentLoop:
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            bot_id=msg.metadata.get("bot_id") if msg.metadata else None,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
