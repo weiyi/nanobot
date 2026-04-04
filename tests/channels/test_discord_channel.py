@@ -78,6 +78,7 @@ class _FakeChannel:
         self.sent_payloads: list[dict] = []
         self.trigger_typing_calls = 0
         self.typing_enter_hook = None
+        self._history_messages: list = []
 
     async def send(self, **kwargs) -> None:
         payload = dict(kwargs)
@@ -88,6 +89,16 @@ class _FakeChannel:
 
     def get_partial_message(self, message_id: int) -> _FakePartialMessage:
         return _FakePartialMessage(message_id)
+
+    def history(self, *, limit: int = 200, before=None, oldest_first: bool = False):
+        async def _iter():
+            msgs = [m for m in self._history_messages if before is None or m.id < before.id]
+            if not oldest_first:
+                msgs = list(reversed(msgs))
+            for m in msgs[:limit]:
+                yield m
+
+        return _iter()
 
     def typing(self):
         channel = self
@@ -145,13 +156,14 @@ def _make_message(
     mentions: list[object] | None = None,
     attachments: list[object] | None = None,
     reply_to: int | None = None,
+    channel: _FakeChannel | None = None,
 ):
     # Factory for incoming Discord message objects with optional guild/reply/attachments.
     guild = SimpleNamespace(id=guild_id) if guild_id is not None else None
     reference = SimpleNamespace(message_id=reply_to) if reply_to is not None else None
     return SimpleNamespace(
         author=SimpleNamespace(id=author_id, bot=author_bot),
-        channel=_FakeChannel(channel_id),
+        channel=channel or _FakeChannel(channel_id),
         content=content,
         guild=guild,
         mentions=mentions or [],
@@ -249,10 +261,11 @@ async def test_stop_is_safe_after_partial_start(monkeypatch) -> None:
 async def test_on_message_ignores_bot_messages() -> None:
     # Incoming bot-authored messages must be ignored to prevent feedback loops.
     channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+    channel._bot_user_id = "123"
     handled: list[dict] = []
     channel._handle_message = lambda **kwargs: handled.append(kwargs)  # type: ignore[method-assign]
 
-    await channel._on_message(_make_message(author_bot=True))
+    await channel._on_message(_make_message(author_id=123, author_bot=True))
 
     assert handled == []
 
@@ -283,7 +296,68 @@ async def test_on_message_accepts_allowlisted_dm() -> None:
 
     assert len(handled) == 1
     assert handled[0]["chat_id"] == "456"
-    assert handled[0]["metadata"] == {"message_id": "789", "guild_id": None, "reply_to": None}
+    assert handled[0]["metadata"] == {"message_id": "789", "guild_id": None, "reply_to": None, "thread_id": None}
+
+
+def test_derive_session_key_for_reply_message() -> None:
+    message = SimpleNamespace(
+        channel=SimpleNamespace(id=456),
+        reference=SimpleNamespace(message_id=321),
+    )
+
+    assert DiscordChannel._derive_session_key(message) == "discord:456:reply:321"
+
+
+def test_derive_session_key_for_thread_message() -> None:
+    message = SimpleNamespace(
+        channel=SimpleNamespace(id=222, is_thread=True),
+        reference=None,
+    )
+
+    assert DiscordChannel._derive_session_key(message) == "discord:222"
+
+
+@pytest.mark.asyncio
+async def test_on_message_passes_session_key_for_reply_history() -> None:
+    channel = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+
+    await channel._on_message(_make_message(author_id=123, channel_id=456, reply_to=321))
+
+    assert len(handled) == 1
+    assert handled[0]["session_key"] == "discord:456:reply:321"
+
+
+@pytest.mark.asyncio
+async def test_on_message_includes_thread_history_context() -> None:
+    channel_obj = _FakeChannel(channel_id=456)
+    old1 = _make_message(author_id=111, channel=channel_obj, message_id=10, content="first")
+    old2 = _make_message(author_id=222, channel=channel_obj, message_id=20, content="second")
+    channel_obj._history_messages = [old1, old2]
+
+    message = _make_message(author_id=123, channel=channel_obj, message_id=30, content="current")
+
+    bot = DiscordChannel(DiscordConfig(enabled=True, allow_from=["*"]), MessageBus())
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    bot._handle_message = capture_handle  # type: ignore[method-assign]
+
+    await bot._on_message(message)
+
+    assert len(handled) == 1
+    assert handled[0]["metadata"]["thread_history_count"] == 2
+    assert handled[0]["content"].startswith("[Thread history - most recent first]")
+    assert "first" in handled[0]["content"]
+    assert "second" in handled[0]["content"]
+    assert handled[0]["content"].endswith("current")
 
 
 @pytest.mark.asyncio
@@ -332,6 +406,35 @@ async def test_on_message_accepts_mentioned_guild_message() -> None:
 
     assert len(handled) == 1
     assert handled[0]["metadata"]["reply_to"] == "321"
+
+
+@pytest.mark.asyncio
+async def test_on_bot_message_accepts_mentioned_guild_message() -> None:
+    # Other bots should be allowed to mention this bot and be processed.
+    channel = DiscordChannel(
+        DiscordConfig(enabled=True, allow_from=["*"], group_policy="mention"),
+        MessageBus(),
+    )
+    channel._bot_user_id = "999"
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+
+    await channel._on_message(
+        _make_message(
+            author_id=222,
+            author_bot=True,
+            guild_id=1,
+            content="<@999> hello",
+            mentions=[SimpleNamespace(id=999)],
+        )
+    )
+
+    assert len(handled) == 1
+    assert handled[0]["metadata"]["guild_id"] == "1"
 
 
 @pytest.mark.asyncio

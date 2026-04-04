@@ -322,10 +322,10 @@ class DiscordChannel(BaseChannel):
 
     async def _handle_discord_message(self, message: discord.Message) -> None:
         """Handle incoming Discord messages from discord.py."""
-        if message.author.bot:
+        sender_id = str(message.author.id)
+        if message.author.bot and self._bot_user_id is not None and sender_id == self._bot_user_id:
             return
 
-        sender_id = str(message.author.id)
         channel_id = self._channel_key(message.channel)
         content = message.content or ""
 
@@ -335,6 +335,13 @@ class DiscordChannel(BaseChannel):
         media_paths, attachment_markers = await self._download_attachments(message.attachments)
         full_content = self._compose_inbound_content(content, attachment_markers)
         metadata = self._build_inbound_metadata(message)
+
+        # Fetch thread history context for the first pass in this conversation.
+        history_lines = await self._fetch_thread_history(message)
+        if history_lines:
+            context_text = "[Thread history - most recent first]" + "\n" + "\n".join(history_lines)
+            full_content = context_text + "\n\n" + full_content
+            metadata["thread_history_count"] = len(history_lines)
 
         await self._start_typing(message.channel)
 
@@ -356,6 +363,8 @@ class DiscordChannel(BaseChannel):
 
         self._working_emoji_tasks[channel_id] = asyncio.create_task(_delayed_working_emoji())
 
+        session_key = self._derive_session_key(message)
+
         try:
             await self._handle_message(
                 sender_id=sender_id,
@@ -363,6 +372,7 @@ class DiscordChannel(BaseChannel):
                 content=full_content,
                 media=media_paths,
                 metadata=metadata,
+                session_key=session_key,
             )
         except Exception:
             await self._clear_reactions(channel_id)
@@ -424,11 +434,57 @@ class DiscordChannel(BaseChannel):
     def _build_inbound_metadata(message: discord.Message) -> dict[str, str | None]:
         """Build metadata for inbound Discord messages."""
         reply_to = str(message.reference.message_id) if message.reference and message.reference.message_id else None
+        thread_id = str(message.channel.id) if getattr(message.channel, "is_thread", False) else None
         return {
             "message_id": str(message.id),
             "guild_id": str(message.guild.id) if message.guild else None,
             "reply_to": reply_to,
+            "thread_id": thread_id,
         }
+
+    @staticmethod
+    def _derive_session_key(message: discord.Message) -> str | None:
+        """Derive session key for Discord history/threading semantics."""
+        channel = message.channel
+
+        # Real Discord threads should have independent history by thread ID.
+        if getattr(channel, "is_thread", False) or (DISCORD_AVAILABLE and isinstance(channel, discord.Thread)):
+            return f"discord:{channel.id}"
+
+        # Reply chains in public channels should be treated as separate sessions.
+        if message.reference and getattr(message.reference, "message_id", None):
+            return f"discord:{channel.id}:reply:{message.reference.message_id}"
+
+        # Fall back to default channel-based history.
+        return None
+
+    async def _fetch_thread_history(self, message: discord.Message) -> list[str]:
+        """Fetch up to 200 messages from the ancestor thread/channel before the current message."""
+        channel = message.channel
+        if not hasattr(channel, "history"):
+            return []
+
+        messages = []
+        try:
+            # Discord API returns most recent first by default, so preserve chronological order.
+            async for item in channel.history(limit=200, before=message, oldest_first=True):
+                if getattr(item, "author", None) and getattr(getattr(item, "author"), "bot", False):
+                    continue
+                content = item.content or ""
+                attachments = []
+                for att in getattr(item, "attachments", []):
+                    if getattr(att, "filename", None):
+                        attachments.append(f"[attachment: {att.filename}]")
+                part = "\n".join(x for x in [content, *attachments] if x)
+                if not part:
+                    part = "[empty message]"
+                author_id = str(getattr(getattr(item, "author", None), "id", "unknown"))
+                messages.append(f"{author_id}: {part}")
+
+            return messages
+        except Exception as e:
+            logger.debug("Discord thread history fetch failed: {}", e)
+            return []
 
     def _should_respond_in_group(self, message: discord.Message, content: str) -> bool:
         """Check if the bot should respond in a guild channel based on policy."""
