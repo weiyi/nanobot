@@ -46,6 +46,7 @@ class DiscordConfig(Base):
     read_receipt_emoji: str = "👀"
     working_emoji: str = "🔧"
     working_emoji_delay: float = 2.0
+    history_fetch_limit: int = 200
 
     @field_validator("allow_from", mode="before")
     @classmethod
@@ -481,7 +482,11 @@ class DiscordChannel(BaseChannel):
         messages = []
         try:
             # Discord API returns most recent first by default, so preserve chronological order.
-            async for item in channel.history(limit=200, before=message, oldest_first=True):
+            async for item in channel.history(
+                limit=self.config.history_fetch_limit,
+                before=message,
+                oldest_first=True,
+            ):
                 if getattr(item, "author", None) and getattr(getattr(item, "author"), "bot", False):
                     continue
                 content = item.content or ""

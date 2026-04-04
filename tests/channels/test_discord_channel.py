@@ -371,6 +371,11 @@ def test_discord_config_allows_numeric_allow_from() -> None:
     assert config.allow_from == ["123", "456"]
 
 
+def test_discord_config_allows_history_fetch_limit_alias() -> None:
+    config = DiscordConfig(model_validate={"historyFetchLimit": 50})
+    assert config.history_fetch_limit == 50
+
+
 @pytest.mark.asyncio
 async def test_on_message_includes_bot_id_metadata() -> None:
     channel = DiscordChannel(

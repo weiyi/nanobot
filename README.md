@@ -383,7 +383,11 @@ If you prefer to configure manually, add the following to `~/.nanobot/config.jso
       "token": "YOUR_BOT_TOKEN",
       "botId": "YOUR_DISCORD_BOT_USER_ID",
       "allowFrom": ["YOUR_USER_ID"],
-      "groupPolicy": "mention"
+      "groupPolicy": "mention",
+      "readReceiptEmoji": "👀",
+      "workingEmoji": "🔧",
+      "workingEmojiDelay": 2.0,
+      "historyFetchLimit": 200
     }
   }
 }
