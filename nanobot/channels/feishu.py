@@ -298,6 +298,7 @@ class FeishuChannel(BaseChannel):
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
+        self._bot_open_id: str | None = None
 
     @staticmethod
     def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
@@ -378,6 +379,15 @@ class FeishuChannel(BaseChannel):
         self._ws_thread = threading.Thread(target=run_ws, daemon=True)
         self._ws_thread.start()
 
+        # Fetch bot's own open_id for accurate @mention matching
+        self._bot_open_id = await asyncio.get_running_loop().run_in_executor(
+            None, self._fetch_bot_open_id
+        )
+        if self._bot_open_id:
+            logger.info("Feishu bot open_id: {}", self._bot_open_id)
+        else:
+            logger.warning("Could not fetch bot open_id; @mention matching may be inaccurate")
+
         logger.info("Feishu bot started with WebSocket long connection")
         logger.info("No public IP required - using WebSocket to receive events")
 
@@ -396,6 +406,26 @@ class FeishuChannel(BaseChannel):
         self._running = False
         logger.info("Feishu bot stopped")
 
+    def _fetch_bot_open_id(self) -> str | None:
+        """Fetch the bot's own open_id via GET /open-apis/bot/v3/info."""
+        try:
+            import lark_oapi as lark
+            request = lark.RawRequest.builder() \
+                .http_method(lark.HttpMethod.GET) \
+                .uri("/open-apis/bot/v3/info") \
+                .build()
+            response = self._client.request(request)
+            if response.success():
+                import json
+                data = json.loads(response.raw.content)
+                bot = (data.get("data") or data).get("bot") or data.get("bot") or {}
+                return bot.get("open_id")
+            logger.warning("Failed to get bot info: code={}, msg={}", response.code, response.msg)
+            return None
+        except Exception as e:
+            logger.warning("Error fetching bot info: {}", e)
+            return None
+
     def _is_bot_mentioned(self, message: Any) -> bool:
         """Check if the bot is @mentioned in the message."""
         raw_content = message.content or ""
@@ -406,9 +436,14 @@ class FeishuChannel(BaseChannel):
             mid = getattr(mention, "id", None)
             if not mid:
                 continue
-            # Bot mentions have no user_id (None or "") but a valid open_id
-            if not getattr(mid, "user_id", None) and (getattr(mid, "open_id", None) or "").startswith("ou_"):
-                return True
+            mention_open_id = getattr(mid, "open_id", None) or ""
+            if self._bot_open_id:
+                if mention_open_id == self._bot_open_id:
+                    return True
+            else:
+                # Fallback heuristic when bot open_id is unavailable
+                if not getattr(mid, "user_id", None) and mention_open_id.startswith("ou_"):
+                    return True
         return False
 
     def _is_group_message_for_bot(self, message: Any) -> bool:
