@@ -225,6 +225,8 @@ class GitHubCopilotProvider(OpenAICompatProvider):
         if reasoning_effort:
             return False
         name = deployment_name.lower()
+        if "oswe-vscode-prime" in name:
+            return False
         return not any(token in name for token in ("gpt-5", "o1", "o3", "o4"))
 
     def _build_body(

@@ -373,13 +373,13 @@ async def test_github_copilot_provider_refreshes_client_api_key_before_chat():
     })
 
     with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI", return_value=mock_client):
-        provider = GitHubCopilotProvider(default_model="github-copilot/gpt-5.1")
+        provider = GitHubCopilotProvider(default_model="github-copilot/gpt-4.1")
 
     provider._get_copilot_access_token = AsyncMock(return_value="copilot-access-token")
 
     response = await provider.chat(
         messages=[{"role": "user", "content": "hi"}],
-        model="github-copilot/gpt-5.1",
+        model="github-copilot/gpt-4.1",
         max_tokens=16,
         temperature=0.1,
     )
@@ -388,6 +388,41 @@ async def test_github_copilot_provider_refreshes_client_api_key_before_chat():
     assert provider._client.api_key == "copilot-access-token"
     provider._get_copilot_access_token.assert_awaited_once()
     mock_client.responses.create.assert_awaited_once()
+    assert mock_client.responses.create.call_args.kwargs["temperature"] == 0.1
+
+
+@pytest.mark.asyncio
+async def test_github_copilot_provider_omits_temperature():
+    from nanobot.providers.github_copilot_provider import GitHubCopilotProvider
+
+    mock_client = MagicMock()
+    mock_client.api_key = "no-key"
+    mock_client.responses.create = AsyncMock(return_value={
+        "output": [{
+            "type": "message",
+            "content": [{"type": "output_text", "text": "ok"}],
+        }],
+        "status": "completed",
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    })
+
+    with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI", return_value=mock_client):
+        provider = GitHubCopilotProvider(default_model="github-copilot/oswe-vscode-prime")
+
+    provider._get_copilot_access_token = AsyncMock(return_value="copilot-access-token")
+
+    response = await provider.chat(
+        messages=[{"role": "user", "content": "hi"}],
+        model="github-copilot/oswe-vscode-prime",
+        max_tokens=16,
+        temperature=0.2,
+    )
+
+    assert response.content == "ok"
+    assert provider._client.api_key == "copilot-access-token"
+    provider._get_copilot_access_token.assert_awaited_once()
+    mock_client.responses.create.assert_awaited_once()
+    assert "temperature" not in mock_client.responses.create.call_args.kwargs
 
 
 def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():

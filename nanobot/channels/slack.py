@@ -63,6 +63,8 @@ class SlackChannel(BaseChannel):
         self._web_client: AsyncWebClient | None = None
         self._socket_client: SocketModeClient | None = None
         self._bot_user_id: str | None = None
+        # Cache bot_id -> user_id resolutions for inter-bot messaging
+        self._bot_user_id_cache: dict[str, str] = {}
 
     async def start(self) -> None:
         """Start the Slack Socket Mode client."""
@@ -172,9 +174,26 @@ class SlackChannel(BaseChannel):
         sender_id = event.get("user")
         chat_id = event.get("channel")
 
-        # Ignore bot/system messages (any subtype = not a normal user message)
-        if event.get("subtype"):
+        # Ignore bot/system messages with subtypes — EXCEPT bot_message within
+        # channels/groups, which is how another nanobot posts to a shared channel.
+        # Bot-to-bot DMs are intentionally NOT supported: they are invisible to the
+        # user and bots must communicate in channels where humans can observe.
+        subtype = event.get("subtype")
+        channel_type_early = event.get("channel_type") or ""
+        if subtype == "bot_message":
+            if channel_type_early == "im":
+                # Bot DMs are invisible to users — drop silently.
+                return
+            bot_id = event.get("bot_id")
+            if not bot_id:
+                return
+            resolved = await self._resolve_bot_user_id(bot_id)
+            if not resolved:
+                return
+            sender_id = resolved
+        elif subtype:
             return
+
         if self._bot_user_id and sender_id == self._bot_user_id:
             return
 
@@ -205,7 +224,27 @@ class SlackChannel(BaseChannel):
         if channel_type != "im" and not self._should_respond_in_channel(event_type, text, chat_id):
             return
 
+        # Track whether the message was a direct mention before stripping it.
+        # Used below to inject a self-identity prefix so the agent knows it is
+        # the addressed party and should respond in first person as itself.
+        was_directly_mentioned = (
+            event_type == "app_mention"
+            or (self._bot_user_id is not None and f"<@{self._bot_user_id}>" in text)
+        )
+
         text = self._strip_bot_mention(text)
+
+        # Inject a grounding prefix in channel contexts so the agent understands
+        # it is the RECIPIENT of this message, not a third party being discussed.
+        # This prevents the "speaks about itself in third person" failure mode.
+        if channel_type != "im" and was_directly_mentioned:
+            text = f"[This message is addressed directly to you]\n{text}"
+
+        # For bot-originated messages, prepend a visible attribution so the agent
+        # always knows it is replying to another bot and can decide whether a mention
+        # is needed (only when the reply requires action/response from that bot).
+        if subtype == "bot_message" and sender_id:
+            text = f"[Bot message from <@{sender_id}>]\n{text}"
 
         thread_ts = event.get("thread_ts")
         if self.config.reply_in_thread and not thread_ts:
@@ -235,6 +274,7 @@ class SlackChannel(BaseChannel):
                         "thread_ts": thread_ts,
                         "channel_type": channel_type,
                     },
+                    "bot_id": self._bot_user_id,
                 },
                 session_key=session_key,
             )
@@ -262,6 +302,22 @@ class SlackChannel(BaseChannel):
                 )
             except Exception as e:
                 logger.debug("Slack done reaction failed: {}", e)
+
+    async def _resolve_bot_user_id(self, bot_id: str) -> str | None:
+        """Resolve a Slack bot_id to its user_id, with caching. Returns None on failure."""
+        if bot_id in self._bot_user_id_cache:
+            return self._bot_user_id_cache[bot_id]
+        if not self._web_client:
+            return None
+        try:
+            result = await self._web_client.bots_info(bot=bot_id)
+            user_id = (result.get("bot") or {}).get("user_id")
+            if user_id:
+                self._bot_user_id_cache[bot_id] = user_id
+            return user_id
+        except Exception as e:
+            logger.debug("bots.info failed for {}: {}", bot_id, e)
+            return None
 
     def _is_allowed(self, sender_id: str, chat_id: str, channel_type: str) -> bool:
         if channel_type == "im":
