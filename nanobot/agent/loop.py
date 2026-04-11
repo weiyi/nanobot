@@ -918,6 +918,8 @@ class AgentLoop:
             await self._post_coordination_claim(msg, arbiter_reason)
 
         await self.consolidator.maybe_consolidate_by_tokens(session)
+
+        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()

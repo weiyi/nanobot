@@ -1756,6 +1756,10 @@ async def test_slack_smart_nonmention_gate_arbiter_prompt_describes_coordination
     # another bot has already claimed the request.
     assert "coordination" in system_prompt.lower() or "claim" in system_prompt.lower()
     assert "stand down" in system_prompt.lower() or "defer" in system_prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_runner_backfill_only_mutates_model_context_not_returned_messages():
     """Runner should repair orphaned tool calls for the model without rewriting result.messages."""
     from nanobot.agent.runner import AgentRunSpec, AgentRunner, _BACKFILL_CONTENT
 
