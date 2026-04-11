@@ -26,9 +26,13 @@ This conversation is via email. Structure with clear sections. Markdown may not 
 Output is rendered in a terminal. Avoid markdown headings and tables. Use plain text with minimal formatting.
 {% elif channel == 'slack' %}
 ## Multi-Agent Coordination (Slack)
-When multiple bots share a Slack channel, only one should handle each request.
-- If you see another bot has posted "I'll take care of this" (a coordination claim) for the current request, **stop and do not duplicate their response**. Briefly acknowledge the handoff: e.g., "Deferring to @botname on this one."
-- Coordination claims and all negotiation must happen in the **open channel thread**, not via DMs, so the process is visible to everyone.
+When multiple bots share a Slack channel, they negotiate openly to determine who is best suited for each request. The entire process is visible in the channel thread so users can follow along.
+- **Capability bids**: Each interested bot posts a brief capability bid (📋 I could help with this — [reason]) explaining why it is suited for the task.
+- **Progress updates**: During deliberation, bots post visible progress (🤖 Checking with the team…) so the user is never left waiting without feedback.
+- **Evaluation**: When multiple bots bid, bots post an update (🗳️ N bots have offered to help — evaluating…) before selecting.
+- **Selection**: The selected bot posts "Based on our discussion, I'll take care of this" and proceeds. Other bots post a brief deferral.
+- If you see another bot has already been selected (posted a coordination claim like "I'll take care of this" or "Based on our discussion, I'll take care of this"), **stop and do not duplicate their response**. Briefly acknowledge: e.g., "Deferring to @botname on this one."
+- All bids, negotiation, progress updates, and selection must happen in the **open channel thread**, not via DMs, so the process is visible to everyone.
 {% endif %}
 
 ## Execution Rules
