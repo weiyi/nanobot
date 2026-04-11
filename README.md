@@ -703,7 +703,12 @@ Uses **Socket Mode** — no public URL required.
       "botToken": "xoxb-...",
       "appToken": "xapp-...",
       "allowFrom": ["YOUR_SLACK_USER_ID"],
-      "groupPolicy": "mention"
+      "groupPolicy": "smart",
+      "nonMentionEvaluation": {
+        "enabled": true,
+        "confidenceThreshold": 0.7,
+        "maxTokens": 96
+      }
     }
   }
 }
@@ -718,7 +723,8 @@ nanobot gateway
 DM the bot directly or @mention it in a channel — it should respond!
 
 > [!TIP]
-> - `groupPolicy`: `"mention"` (default — respond only when @mentioned), `"open"` (respond to all channel messages), or `"allowlist"` (restrict to specific channels).
+> - `groupPolicy`: `"mention"` (default — respond only when @mentioned), `"smart"` (always respond to mentions; for unmentioned channel messages, run a lightweight LLM arbitration step first), `"open"` (respond to all channel messages), or `"allowlist"` (restrict to specific channels).
+> - `nonMentionEvaluation` lets you tune the arbiter threshold/model when using `"groupPolicy": "smart"`.
 > - DM policy defaults to open. Set `"dm": {"enabled": false}` to disable DMs.
 
 </details>

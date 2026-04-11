@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import re
 import time
 from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
@@ -298,6 +299,206 @@ class AgentLoop:
 
         return format_tool_hints(tool_calls)
 
+    @staticmethod
+    def _stringify_gate_content(content: Any) -> str:
+        """Flatten persisted message content into plain text for routing decisions."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text)
+                elif item is not None:
+                    parts.append(str(item))
+            return "\n".join(parts)
+        if content is None:
+            return ""
+        return str(content)
+
+    def _needs_reply_gate(self, msg: InboundMessage) -> bool:
+        """True when this inbound message should be LLM-arbitrated before replying."""
+        if msg.channel != "slack":
+            return False
+        slack_meta = (msg.metadata or {}).get("slack", {})
+        if not isinstance(slack_meta, dict):
+            return False
+        if (slack_meta.get("channel_type") or "") == "im":
+            return False
+        if bool(slack_meta.get("was_directly_mentioned")):
+            return False
+        return bool(slack_meta.get("smart_enabled")) or slack_meta.get("group_policy") == "smart"
+
+    @staticmethod
+    def _looks_like_action_request(text: str | None) -> bool:
+        """Heuristic: imperative or ask-style messages should bias toward replying."""
+        cleaned = " ".join((text or "").strip().split())
+        if not cleaned:
+            return False
+
+        lowered = cleaned.lower()
+        prefixes = (
+            "check ", "please check ", "look ", "look up ", "please look ",
+            "find ", "search ", "fetch ", "get ", "pull ", "review ",
+            "verify ", "open ", "show ", "tell me ", "summarize ",
+            "list ", "compare ", "inspect ", "investigate ", "debug ",
+            "fix ", "update ", "run ", "read ", "write ", "send ",
+            "can you ", "could you ", "would you ", "will you ", "please ",
+        )
+        if lowered.startswith(prefixes):
+            return True
+
+        return bool(re.match(r"^(?:hey\s+|hi\s+)?(?:bot\s+)?(?:can|could|would|will)\s+you\b", lowered))
+
+    @classmethod
+    def _parse_reply_gate_decision(cls, content: str | None) -> tuple[bool, float, str]:
+        """Parse a reply-gate decision from JSON or a conservative yes/no fallback."""
+        text = (cls._strip_think(content) or "").strip()
+        if not text:
+            return False, 0.0, "empty arbiter response"
+
+        candidates = [text]
+        if text.startswith("```"):
+            stripped = text.strip("`")
+            if "\n" in stripped:
+                candidates.append(stripped.split("\n", 1)[1].rsplit("\n", 1)[0].strip())
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidates.append(text[start:end + 1])
+
+        for candidate in candidates:
+            try:
+                payload = json.loads(candidate)
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                flag = payload.get("should_reply")
+                if isinstance(flag, bool):
+                    confidence_raw = payload.get("confidence", 1.0 if flag else 0.0)
+                    try:
+                        confidence = float(confidence_raw)
+                    except (TypeError, ValueError):
+                        confidence = 1.0 if flag else 0.0
+                    reason = str(payload.get("reason") or "").strip()
+                    return flag, max(0.0, min(confidence, 1.0)), reason
+
+        lowered = text.lower()
+        if any(token in lowered for token in ('"should_reply": true', "'should_reply': true", "should_reply=true", "reply=true")):
+            return True, 1.0, "fallback true token"
+        if any(token in lowered for token in ('"should_reply": false', "'should_reply': false", "should_reply=false", "reply=false")):
+            return False, 1.0, "fallback false token"
+        if lowered.startswith("yes"):
+            return True, 0.75, "fallback yes"
+        if lowered.startswith("no"):
+            return False, 0.75, "fallback no"
+        return False, 0.0, "unparseable arbiter response"
+
+    async def _should_reply_to_inbound(self, msg: InboundMessage, session: Session) -> bool:
+        """Use a lightweight LLM arbitration step for shared-channel non-mentions."""
+        if not self._needs_reply_gate(msg):
+            return True
+
+        slack_meta = (msg.metadata or {}).get("slack", {})
+        threshold_raw = slack_meta.get("smart_confidence_threshold", 0.7)
+        try:
+            confidence_threshold = float(threshold_raw)
+        except (TypeError, ValueError):
+            confidence_threshold = 0.7
+
+        recent_history = session.get_history(max_messages=6)
+        history_lines: list[str] = []
+        for item in recent_history[-6:]:
+            role = str(item.get("role") or "unknown")
+            content = self._stringify_gate_content(item.get("content"))
+            content = " ".join((self._strip_think(content) or "").split())
+            if not content and item.get("tool_calls"):
+                tool_names = [
+                    tc.get("function", {}).get("name", "")
+                    for tc in item.get("tool_calls", [])
+                    if isinstance(tc, dict)
+                ]
+                content = f"[tool_calls: {', '.join(name for name in tool_names if name)}]"
+            if not content:
+                continue
+            history_lines.append(f"- {role}: {content[:240]}")
+
+        sender_kind = "bot" if slack_meta.get("is_bot_message") else "human"
+        arbiter_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a reply arbiter for one Slack bot in a shared channel with humans and other bots. "
+                    "Decide whether THIS bot should reply to the newest message. "
+                    "Mentions always reply=true, but this request is only for non-mentioned messages. "
+                    "Reply true only if the message clearly needs this bot, continues an active exchange this bot is already in, "
+                    "or specifically benefits from this bot's capabilities. "
+                    "If unsure, choose false. "
+                    "Return strict JSON only: "
+                    '{"should_reply": true|false, "confidence": 0.0, "reason": "short"}.'
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"channel=slack\n"
+                    f"chat_id={msg.chat_id}\n"
+                    f"sender_id={msg.sender_id}\n"
+                    f"sender_kind={sender_kind}\n"
+                    f"was_directly_mentioned=false\n\n"
+                    f"Recent thread history:\n"
+                    f"{chr(10).join(history_lines) if history_lines else '(no recent thread history)'}\n\n"
+                    f"Newest message:\n{msg.content}"
+                ),
+            },
+        ]
+
+        try:
+            response = await self.provider.chat_with_retry(
+                messages=arbiter_messages,
+                tools=None,
+                model=str(slack_meta.get("smart_model") or self.model),
+                max_tokens=int(slack_meta.get("smart_max_tokens") or 96),
+                temperature=float(slack_meta.get("smart_temperature", 0.0) or 0.0),
+                reasoning_effort="low",
+                retry_mode=self.provider_retry_mode,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Reply gate failed for {}:{}; defaulting to no-reply. Error: {}",
+                msg.channel,
+                msg.chat_id,
+                exc,
+            )
+            return False
+
+        should_reply, confidence, reason = self._parse_reply_gate_decision(response.content)
+        approved = should_reply and confidence >= confidence_threshold
+        action_request = self._looks_like_action_request(msg.content)
+
+        if action_request and not approved:
+            low_signal_reason = reason in {"empty arbiter response", "unparseable arbiter response"}
+            if low_signal_reason or confidence < confidence_threshold:
+                approved = True
+                should_reply = True
+                confidence = max(confidence, confidence_threshold)
+                reason = f"action-request bias ({reason or 'low confidence'})"
+
+        logger.info(
+            "Reply gate for {}:{} -> approved={} should_reply={} confidence={:.2f} threshold={:.2f} action_request={} reason={}",
+            msg.channel,
+            msg.chat_id,
+            approved,
+            should_reply,
+            confidence,
+            confidence_threshold,
+            action_request,
+            reason or "-",
+        )
+        return approved
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -533,6 +734,10 @@ class AgentLoop:
         ctx = CommandContext(msg=msg, session=session, key=key, raw=raw, loop=self)
         if result := await self.commands.dispatch(ctx):
             return result
+
+        if not await self._should_reply_to_inbound(msg, session):
+            logger.info("Skipping reply to {}:{} after smart reply gate", msg.channel, msg.sender_id)
+            return None
 
         await self.consolidator.maybe_consolidate_by_tokens(session)
 

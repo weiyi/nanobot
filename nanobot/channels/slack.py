@@ -27,6 +27,16 @@ class SlackDMConfig(Base):
     allow_from: list[str] = Field(default_factory=list)
 
 
+class SlackNonMentionEvaluationConfig(Base):
+    """LLM arbitration settings for non-mentioned group messages."""
+
+    enabled: bool = True
+    model: str = ""
+    confidence_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    temperature: float = 0.0
+    max_tokens: int = Field(default=96, ge=1, le=512)
+
+
 class SlackConfig(Base):
     """Slack channel configuration."""
 
@@ -42,6 +52,7 @@ class SlackConfig(Base):
     allow_from: list[str] = Field(default_factory=list)
     group_policy: str = "mention"
     group_allow_from: list[str] = Field(default_factory=list)
+    non_mention_evaluation: SlackNonMentionEvaluationConfig = Field(default_factory=SlackNonMentionEvaluationConfig)
     dm: SlackDMConfig = Field(default_factory=SlackDMConfig)
 
 
@@ -174,27 +185,56 @@ class SlackChannel(BaseChannel):
         sender_id = event.get("user")
         chat_id = event.get("channel")
 
-        # Ignore bot/system messages with subtypes — EXCEPT bot_message within
-        # channels/groups, which is how another nanobot posts to a shared channel.
-        # Bot-to-bot DMs are intentionally NOT supported: they are invisible to the
-        # user and bots must communicate in channels where humans can observe.
+        # Ignore bot/system messages with subtypes, but allow bot messages
+        # from other Slack apps or integrations. Slack may represent bot-originated
+        # events with `subtype == "bot_message"`, `bot_id`, or `bot_profile`.
         subtype = event.get("subtype")
         channel_type_early = event.get("channel_type") or ""
-        if subtype == "bot_message":
+        bot_id = event.get("bot_id")
+        bot_profile = event.get("bot_profile")
+        is_bot_message = (
+            subtype == "bot_message"
+            or bot_id is not None
+            or bot_profile is not None
+        )
+
+        logger.debug(
+            "Slack bot detection: subtype={} bot_id={} bot_profile={} sender_id={} channel_type={} is_bot_message={} event_type={}",
+            subtype,
+            bot_id,
+            bot_profile,
+            sender_id,
+            channel_type_early,
+            is_bot_message,
+            event_type,
+        )
+
+        if is_bot_message:
             if channel_type_early == "im":
                 # Bot DMs are invisible to users — drop silently.
+                logger.debug("Dropping bot DM message from bot_id=%s", bot_id or sender_id)
                 return
-            bot_id = event.get("bot_id")
+            bot_id = bot_id or (bot_profile or {}).get("bot_id")
+            if not bot_id and sender_id and sender_id.startswith("B"):
+                bot_id = sender_id
             if not bot_id:
+                logger.debug(
+                    "Dropping bot-originated event because bot_id could not be determined: sender_id=%s bot_profile=%s",
+                    sender_id,
+                    bot_profile,
+                )
                 return
             resolved = await self._resolve_bot_user_id(bot_id)
             if not resolved:
+                logger.debug("Dropping bot-originated event because bots_info resolution failed for bot_id=%s", bot_id)
                 return
             sender_id = resolved
         elif subtype:
+            logger.debug("Dropping non-bot event with subtype=%s", subtype)
             return
 
         if self._bot_user_id and sender_id == self._bot_user_id:
+            logger.debug("Dropping event from self bot user_id=%s", sender_id)
             return
 
         # Avoid double-processing: Slack sends both `message` and `app_mention`
@@ -234,17 +274,19 @@ class SlackChannel(BaseChannel):
 
         text = self._strip_bot_mention(text)
 
-        # Inject a grounding prefix in channel contexts so the agent understands
-        # it is the RECIPIENT of this message, not a third party being discussed.
-        # This prevents the "speaks about itself in third person" failure mode.
+        prefixes: list[str] = []
         if channel_type != "im" and was_directly_mentioned:
-            text = f"[This message is addressed directly to you]\n{text}"
+            # append is_bot_message
+            prefixes.append(f"[This message is addressed directly to you]")
 
-        # For bot-originated messages, prepend a visible attribution so the agent
-        # always knows it is replying to another bot and can decide whether a mention
-        # is needed (only when the reply requires action/response from that bot).
-        if subtype == "bot_message" and sender_id:
-            text = f"[Bot message from <@{sender_id}>]\n{text}"
+        if is_bot_message and sender_id:
+            prefixes.append(f"[Bot message from <@{sender_id}>]")
+            prefixes.append(
+                f"[Reply with a mention to <@{sender_id}> to continue the conversation if REQUIRED. Both gets a prize for clean natural conversations.]"
+            )
+
+        if prefixes:
+            text = "\n".join(prefixes + [text])
 
         thread_ts = event.get("thread_ts")
         if self.config.reply_in_thread and not thread_ts:
@@ -271,8 +313,18 @@ class SlackChannel(BaseChannel):
                 metadata={
                     "slack": {
                         "event": event,
+                        "event_type": event_type,
                         "thread_ts": thread_ts,
                         "channel_type": channel_type,
+                        "group_policy": self.config.group_policy,
+                        "was_directly_mentioned": was_directly_mentioned,
+                        "is_bot_message": is_bot_message,
+                        "smart_enabled": self.config.group_policy == "smart"
+                        and self.config.non_mention_evaluation.enabled,
+                        "smart_confidence_threshold": self.config.non_mention_evaluation.confidence_threshold,
+                        "smart_model": self.config.non_mention_evaluation.model,
+                        "smart_temperature": self.config.non_mention_evaluation.temperature,
+                        "smart_max_tokens": self.config.non_mention_evaluation.max_tokens,
                     },
                     "bot_id": self._bot_user_id,
                 },
@@ -334,6 +386,8 @@ class SlackChannel(BaseChannel):
 
     def _should_respond_in_channel(self, event_type: str, text: str, chat_id: str) -> bool:
         if self.config.group_policy == "open":
+            return True
+        if self.config.group_policy == "smart":
             return True
         if self.config.group_policy == "mention":
             if event_type == "app_mention":

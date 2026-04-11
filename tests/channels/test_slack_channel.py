@@ -151,3 +151,11 @@ async def test_send_updates_reaction_when_final_response_sent() -> None:
     assert fake_web.reactions_add_calls == [
         {"channel": "C123", "name": "white_check_mark", "timestamp": "1700000000.000100"}
     ]
+
+
+def test_smart_group_policy_forwards_non_mentioned_channel_messages() -> None:
+    channel = SlackChannel(SlackConfig(enabled=True, group_policy="smart"), MessageBus())
+    channel._bot_user_id = "U_BOT"
+
+    assert channel._should_respond_in_channel("message", "hello team", "C123") is True
+    assert channel._should_respond_in_channel("app_mention", "<@U_BOT> hi", "C123") is True

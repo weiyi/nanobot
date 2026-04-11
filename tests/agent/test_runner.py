@@ -1454,6 +1454,136 @@ async def test_backfill_repairs_model_context_without_shifting_save_turn_boundar
 
 
 @pytest.mark.asyncio
+async def test_slack_smart_nonmention_gate_skips_reply_when_arbiter_declines(tmp_path):
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    arbiter_response = LLMResponse(
+        content='{"should_reply": false, "confidence": 0.98, "reason": "general chatter"}',
+        tool_calls=[],
+        usage={},
+    )
+    provider.chat_with_retry = AsyncMock(return_value=arbiter_response)
+    provider.chat_stream_with_retry = AsyncMock(return_value=arbiter_response)
+
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    result = await loop._process_message(
+        InboundMessage(
+            channel="slack",
+            sender_id="U1",
+            chat_id="C1",
+            content="just chatting",
+            metadata={
+                "slack": {
+                    "channel_type": "channel",
+                    "group_policy": "smart",
+                    "smart_enabled": True,
+                    "was_directly_mentioned": False,
+                    "smart_confidence_threshold": 0.7,
+                }
+            },
+        )
+    )
+
+    assert result is None
+    assert provider.chat_with_retry.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_slack_smart_nonmention_gate_runs_full_loop_when_arbiter_allows(tmp_path):
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(
+            content='{"should_reply": true, "confidence": 0.91, "reason": "follow-up for this bot"}',
+            tool_calls=[],
+            usage={},
+        ),
+        LLMResponse(content="I can help", tool_calls=[], usage={}),
+    ])
+    provider.chat_stream_with_retry = AsyncMock(return_value=LLMResponse(content="I can help", tool_calls=[], usage={}))
+
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    result = await loop._process_message(
+        InboundMessage(
+            channel="slack",
+            sender_id="U1",
+            chat_id="C1",
+            content="does anyone know the deploy status?",
+            metadata={
+                "slack": {
+                    "channel_type": "channel",
+                    "group_policy": "smart",
+                    "smart_enabled": True,
+                    "was_directly_mentioned": False,
+                    "smart_confidence_threshold": 0.7,
+                }
+            },
+        )
+    )
+
+    assert result is not None
+    assert result.content == "I can help"
+    assert provider.chat_with_retry.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_slack_smart_nonmention_gate_biases_toward_action_requests_when_arbiter_is_empty(tmp_path):
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(content="<think>Need to decide whether to answer.</think>", tool_calls=[], usage={}),
+        LLMResponse(content="I'll check Clawhub for the latest skills.", tool_calls=[], usage={}),
+    ])
+    provider.chat_stream_with_retry = AsyncMock(
+        return_value=LLMResponse(content="I'll check Clawhub for the latest skills.", tool_calls=[], usage={})
+    )
+
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    result = await loop._process_message(
+        InboundMessage(
+            channel="slack",
+            sender_id="U1",
+            chat_id="C1",
+            content="check clawhub for the latest skills",
+            metadata={
+                "slack": {
+                    "channel_type": "channel",
+                    "group_policy": "smart",
+                    "smart_enabled": True,
+                    "was_directly_mentioned": False,
+                    "smart_confidence_threshold": 0.7,
+                }
+            },
+        )
+    )
+
+    assert result is not None
+    assert result.content == "I'll check Clawhub for the latest skills."
+    assert provider.chat_with_retry.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_runner_backfill_only_mutates_model_context_not_returned_messages():
     """Runner should repair orphaned tool calls for the model without rewriting result.messages."""
     from nanobot.agent.runner import AgentRunSpec, AgentRunner, _BACKFILL_CONTENT
