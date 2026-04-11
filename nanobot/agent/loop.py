@@ -464,13 +464,18 @@ class AgentLoop:
                     "Mentions always reply=true, but this request is only for non-mentioned messages. "
                     "Reply true only if the message clearly needs this bot, continues an active exchange this bot is already in, "
                     "or specifically benefits from this bot's capabilities. "
-                    "COORDINATION PROTOCOL: When multiple bots share a channel, whichever bot decides to handle a "
-                    "request first posts a brief public claim ('I'll take care of this') so others can see it and stand down. "
-                    "If the thread history already contains such a claim from another bot for this same request, "
+                    "NEGOTIATION PROTOCOL: When multiple bots share a channel, bots discuss openly "
+                    "to decide who is best suited for the task. Each interested bot posts a capability bid "
+                    "(📋 I could help with this — [reason]) and after a short deliberation window the bots "
+                    "collectively select the most suitable one. "
+                    "If the thread history already contains a coordination claim ('I'll take care of this' or "
+                    "'Based on our discussion, I'll take care of this') from another bot for this same request, "
                     "return false — defer to that bot and do not duplicate the response. "
+                    "Your 'reason' field should briefly describe THIS bot's relevant capabilities "
+                    "for the request — this reason is used as the capability bid in the negotiation. "
                     "If unsure, choose false. "
                     "Return strict JSON only: "
-                    '{"should_reply": true|false, "confidence": 0.0, "reason": "short"}.'
+                    '{"should_reply": true|false, "confidence": 0.0, "reason": "short capability description"}.'
                 ),
             },
             {
@@ -572,6 +577,303 @@ class AgentLoop:
             msg.chat_id,
             content[:80],
         )
+
+    # ------------------------------------------------------------------
+    # Multi-bot negotiation: bots discuss openly who is best suited
+    # ------------------------------------------------------------------
+
+    async def _post_coordination_bid(
+        self,
+        msg: InboundMessage,
+        reason: str = "",
+    ) -> None:
+        """Post a capability bid to the open channel thread.
+
+        Instead of immediately claiming a task, the bot announces its
+        capabilities and willingness so other bots can also bid, enabling
+        a transparent discussion about who is best suited.
+        """
+        slack_meta = (msg.metadata or {}).get("slack", {})
+        _internal_reasons = {"empty arbiter response", "unparseable arbiter response"}
+        clean_reason = reason if reason and reason not in _internal_reasons else ""
+        content = (
+            f"📋 I could help with this — {clean_reason}"
+            if clean_reason
+            else "📋 I could help with this."
+        )
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=content,
+            metadata={
+                "slack": {
+                    "thread_ts": slack_meta.get("thread_ts"),
+                    "channel_type": slack_meta.get("channel_type"),
+                },
+                "_coordination_bid": True,
+            },
+        ))
+        logger.info(
+            "Posted coordination bid for {}:{}: {}",
+            msg.channel,
+            msg.chat_id,
+            content[:80],
+        )
+
+    async def _collect_negotiation_bids(
+        self,
+        pending_queue: asyncio.Queue | None,
+        timeout: float = 5.0,
+    ) -> list[InboundMessage]:
+        """Wait for *timeout* seconds, collecting bot bid messages from the pending queue.
+
+        Non-bid messages are preserved and re-queued so they are not lost.
+        Returns a list of bid messages from other bots.
+        """
+        if pending_queue is None or timeout <= 0:
+            return []
+
+        bids: list[InboundMessage] = []
+        non_bid_messages: list[InboundMessage] = []
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                queued_msg = await asyncio.wait_for(
+                    pending_queue.get(), timeout=min(remaining, 0.5)
+                )
+            except asyncio.TimeoutError:
+                continue
+
+            # Identify bot bid messages by checking for the bid marker in content.
+            # When a bot posts a bid via _post_coordination_bid, the content starts
+            # with the clipboard emoji. Slack channel prepends "[Bot message from ...]"
+            # so we check if the bid marker appears anywhere in the content.
+            slack_meta = (queued_msg.metadata or {}).get("slack", {})
+            is_bot = bool(slack_meta.get("is_bot_message"))
+            has_bid_marker = "📋" in (queued_msg.content or "")
+            if is_bot and has_bid_marker:
+                bids.append(queued_msg)
+                logger.info(
+                    "Collected negotiation bid from {} in {}:{}",
+                    queued_msg.sender_id,
+                    queued_msg.channel,
+                    queued_msg.chat_id,
+                )
+            else:
+                non_bid_messages.append(queued_msg)
+
+        # Re-queue non-bid messages so they are not lost
+        for preserved in non_bid_messages:
+            try:
+                pending_queue.put_nowait(preserved)
+            except asyncio.QueueFull:
+                logger.warning(
+                    "Could not re-queue non-bid message for session, re-publishing to bus"
+                )
+                await self.bus.publish_inbound(preserved)
+
+        return bids
+
+    async def _select_from_negotiation(
+        self,
+        msg: InboundMessage,
+        my_bid_reason: str,
+        other_bids: list[InboundMessage],
+        session: Session,
+    ) -> tuple[bool, str]:
+        """Use LLM to evaluate all bids and decide if this bot should handle the task.
+
+        Returns (should_proceed, selection_reason).
+        """
+        slack_meta = (msg.metadata or {}).get("slack", {})
+        bot_id = msg.metadata.get("bot_id", "this bot")
+
+        # Build bid summary for the LLM
+        bid_lines: list[str] = [f"- This bot ({bot_id}): {my_bid_reason or 'general capabilities'}"]
+        for bid_msg in other_bids:
+            bid_content = (bid_msg.content or "").strip()
+            bid_lines.append(f"- Bot {bid_msg.sender_id}: {bid_content[:300]}")
+
+        selection_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a coordination selector for a team of Slack bots that share a channel. "
+                    "Multiple bots have posted capability bids for a user's request. "
+                    "Your job is to evaluate the bids and determine which SINGLE bot should handle the task. "
+                    "Consider: (1) relevance of stated capabilities to the request, "
+                    "(2) specificity of the bid — a bot that explains WHY it is suited scores higher, "
+                    "(3) if bids are roughly equal, prefer the bot that bid first (listed first). "
+                    "Return strict JSON only: "
+                    '{"select_self": true|false, "reason": "short explanation"}. '
+                    "select_self=true means THIS bot (the first in the list) should proceed."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"User request: {msg.content}\n\n"
+                    f"Capability bids:\n{chr(10).join(bid_lines)}"
+                ),
+            },
+        ]
+
+        try:
+            response = await self.provider.chat_with_retry(
+                messages=selection_messages,
+                tools=None,
+                model=str(slack_meta.get("smart_model") or self.model),
+                max_tokens=int(slack_meta.get("smart_max_tokens") or 96),
+                temperature=0.0,  # Deterministic for consistent selection across bots
+                reasoning_effort="low",
+                retry_mode=self.provider_retry_mode,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Negotiation selection failed for {}:{}; proceeding as fallback. Error: {}",
+                msg.channel,
+                msg.chat_id,
+                exc,
+            )
+            return True, "selection fallback (LLM error)"
+
+        text = (self._strip_think(response.content) or "").strip()
+        # Parse the selection JSON
+        try:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                payload = json.loads(text[start:end + 1])
+                select_self = bool(payload.get("select_self", True))
+                reason = str(payload.get("reason") or "").strip()
+                return select_self, reason
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+        # Fallback: if unparseable, proceed (don't block task execution)
+        logger.warning(
+            "Unparseable negotiation selection for {}:{}: {}",
+            msg.channel,
+            msg.chat_id,
+            text[:120],
+        )
+        return True, "selection fallback (unparseable)"
+
+    async def _post_coordination_selection(
+        self,
+        msg: InboundMessage,
+        selected: bool,
+        reason: str = "",
+    ) -> None:
+        """Post the negotiation selection result to the open channel thread.
+
+        If selected, posts a claim referencing the team discussion.
+        If not selected, posts a brief deferral.
+        """
+        slack_meta = (msg.metadata or {}).get("slack", {})
+        if selected:
+            content = (
+                f"Based on our discussion, I'll take care of this. _{reason}_"
+                if reason
+                else "Based on our discussion, I'll take care of this."
+            )
+            metadata_extra = {"_coordination_claim": True}
+        else:
+            content = (
+                f"Deferring to the better-suited bot. _{reason}_"
+                if reason
+                else "Deferring to the better-suited bot on this one."
+            )
+            metadata_extra = {"_coordination_deferral": True}
+
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=content,
+            metadata={
+                "slack": {
+                    "thread_ts": slack_meta.get("thread_ts"),
+                    "channel_type": slack_meta.get("channel_type"),
+                },
+                **metadata_extra,
+            },
+        ))
+        logger.info(
+            "Posted coordination selection for {}:{}: selected={} {}",
+            msg.channel,
+            msg.chat_id,
+            selected,
+            content[:80],
+        )
+
+    async def _run_coordination_negotiation(
+        self,
+        msg: InboundMessage,
+        arbiter_reason: str,
+        session: Session,
+        pending_queue: asyncio.Queue | None = None,
+    ) -> bool:
+        """Run the full multi-bot negotiation flow.
+
+        1. Post a capability bid to the thread.
+        2. Wait for other bots to post their bids (negotiation_timeout).
+        3. Evaluate all bids via LLM to select the best bot.
+        4. Post the selection result (claim or deferral).
+
+        Returns True if this bot should proceed with the task, False to defer.
+
+        When negotiation_timeout is 0, falls back to immediate claim (legacy behavior).
+        """
+        slack_meta = (msg.metadata or {}).get("slack", {})
+        timeout_raw = slack_meta.get("negotiation_timeout", 5.0)
+        try:
+            negotiation_timeout = float(timeout_raw)
+        except (TypeError, ValueError):
+            negotiation_timeout = 5.0
+
+        # Legacy behavior: immediate claim when negotiation is disabled
+        if negotiation_timeout <= 0:
+            await self._post_coordination_claim(msg, arbiter_reason)
+            return True
+
+        # Phase 1: Post capability bid
+        await self._post_coordination_bid(msg, arbiter_reason)
+
+        # Phase 2: Wait for other bots' bids
+        other_bids = await self._collect_negotiation_bids(
+            pending_queue, timeout=negotiation_timeout
+        )
+
+        # If no other bots bid, proceed without full selection (sole bidder wins)
+        if not other_bids:
+            logger.info(
+                "No other bids received for {}:{}; proceeding as sole bidder",
+                msg.channel,
+                msg.chat_id,
+            )
+            await self._post_coordination_selection(msg, selected=True, reason="sole bidder")
+            return True
+
+        # Phase 3: Evaluate all bids and select the best bot
+        selected, selection_reason = await self._select_from_negotiation(
+            msg, arbiter_reason, other_bids, session
+        )
+
+        # Phase 4: Post the selection result
+        await self._post_coordination_selection(msg, selected=selected, reason=selection_reason)
+
+        if not selected:
+            logger.info(
+                "Deferring task for {}:{} after negotiation: {}",
+                msg.channel,
+                msg.chat_id,
+                selection_reason,
+            )
+        return selected
 
     async def _run_agent_loop(
         self,
@@ -911,11 +1213,16 @@ class AgentLoop:
             logger.info("Skipping reply to {}:{} after smart reply gate", msg.channel, msg.sender_id)
             return None
 
-        # For action requests in a shared channel (smart mode), announce this bot
-        # is taking on the request in the open channel so other bots can see the
-        # claim and stand down, keeping all coordination publicly visible.
+        # For action requests in a shared channel (smart mode), run multi-bot
+        # negotiation: bots post capability bids, discuss openly, and select
+        # the best-suited bot before proceeding.  When negotiation_timeout is 0
+        # this falls back to the legacy immediate-claim behaviour.
         if self._needs_reply_gate(msg) and self._looks_like_action_request(msg.content):
-            await self._post_coordination_claim(msg, arbiter_reason)
+            should_proceed = await self._run_coordination_negotiation(
+                msg, arbiter_reason, session, pending_queue=pending_queue,
+            )
+            if not should_proceed:
+                return None
 
         await self.consolidator.maybe_consolidate_by_tokens(session)
 

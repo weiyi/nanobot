@@ -35,6 +35,12 @@ class SlackNonMentionEvaluationConfig(Base):
     confidence_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
     temperature: float = 0.0
     max_tokens: int = Field(default=96, ge=1, le=512)
+    negotiation_timeout: float = Field(
+        default=5.0,
+        ge=0.0,
+        le=30.0,
+        description="Seconds to wait for other bots to post capability bids before selecting the best bot. Set to 0 to skip negotiation and use immediate claim.",
+    )
 
 
 class SlackConfig(Base):
@@ -325,6 +331,7 @@ class SlackChannel(BaseChannel):
                         "smart_model": self.config.non_mention_evaluation.model,
                         "smart_temperature": self.config.non_mention_evaluation.temperature,
                         "smart_max_tokens": self.config.non_mention_evaluation.max_tokens,
+                        "negotiation_timeout": self.config.non_mention_evaluation.negotiation_timeout,
                     },
                     "bot_id": self._bot_user_id,
                 },
