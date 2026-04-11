@@ -2792,6 +2792,7 @@ async def test_negotiation_posts_bid_then_claim_as_sole_bidder(tmp_path):
     assert "has deployment tools" in bid_msgs[0].content
     assert "I'll take care of this" in claim_msgs[0].content
     assert "no other bots bid" in claim_msgs[0].content
+    assert "starting now" in claim_msgs[0].content
 
 
 @pytest.mark.asyncio
