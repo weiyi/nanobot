@@ -557,7 +557,7 @@ class AgentLoop:
         slack_meta = (msg.metadata or {}).get("slack", {})
         # Build a human-readable claim, omitting internal arbiter noise
         _internal_reasons = {"empty arbiter response", "unparseable arbiter response"}
-        is_internal = not reason or reason in _internal_reasons or any(ir in reason for ir in _internal_reasons)
+        is_internal = not reason or any(ir in reason for ir in _internal_reasons)
         clean_reason = "" if is_internal else reason
         content = f"I'll take care of this. _{clean_reason}_" if clean_reason else "I'll take care of this."
         await self.bus.publish_outbound(OutboundMessage(
@@ -596,7 +596,7 @@ class AgentLoop:
         """
         slack_meta = (msg.metadata or {}).get("slack", {})
         _internal_reasons = {"empty arbiter response", "unparseable arbiter response"}
-        is_internal = not reason or reason in _internal_reasons or any(ir in reason for ir in _internal_reasons)
+        is_internal = not reason or any(ir in reason for ir in _internal_reasons)
         clean_reason = "" if is_internal else reason
         content = (
             f"📋 I could help with this — {clean_reason}"
@@ -663,8 +663,7 @@ class AgentLoop:
             has_bid_marker = "📋" in content
             # Also detect claim messages from other bots so we can defer
             # immediately instead of duplicating the response.
-            _claim_phrases = ("I'll take care of this", "Based on our discussion, I'll take care of this")
-            has_claim = is_bot and any(phrase in content for phrase in _claim_phrases)
+            has_claim = is_bot and "I'll take care of this" in content
             if has_claim:
                 claim_detected = True
                 logger.info(
