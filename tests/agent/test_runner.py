@@ -2788,6 +2788,8 @@ async def test_negotiation_posts_bid_then_claim_as_sole_bidder(tmp_path):
     assert len(bid_msgs) == 1
     assert len(claim_msgs) == 1
     assert "📋" in bid_msgs[0].content
+    # Bid should contain the arbiter's capability reason
+    assert "has deployment tools" in bid_msgs[0].content
     assert "I'll take care of this" in claim_msgs[0].content
     assert "sole bidder" in claim_msgs[0].content
 
