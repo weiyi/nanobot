@@ -422,10 +422,13 @@ class AgentLoop:
             return False, 0.75, "fallback no"
         return False, 0.0, "unparseable arbiter response"
 
-    async def _should_reply_to_inbound(self, msg: InboundMessage, session: Session) -> bool:
-        """Use a lightweight LLM arbitration step for shared-channel non-mentions."""
+    async def _should_reply_to_inbound(self, msg: InboundMessage, session: Session) -> tuple[bool, str]:
+        """Use a lightweight LLM arbitration step for shared-channel non-mentions.
+
+        Returns (approved, reason) where reason is the arbiter's short explanation.
+        """
         if not self._needs_reply_gate(msg):
-            return True
+            return True, ""
 
         slack_meta = (msg.metadata or {}).get("slack", {})
         threshold_raw = slack_meta.get("smart_confidence_threshold", 0.7)
@@ -461,6 +464,10 @@ class AgentLoop:
                     "Mentions always reply=true, but this request is only for non-mentioned messages. "
                     "Reply true only if the message clearly needs this bot, continues an active exchange this bot is already in, "
                     "or specifically benefits from this bot's capabilities. "
+                    "COORDINATION PROTOCOL: When multiple bots share a channel, whichever bot decides to handle a "
+                    "request first posts a brief public claim ('I'll take care of this') so others can see it and stand down. "
+                    "If the thread history already contains such a claim from another bot for this same request, "
+                    "return false — defer to that bot and do not duplicate the response. "
                     "If unsure, choose false. "
                     "Return strict JSON only: "
                     '{"should_reply": true|false, "confidence": 0.0, "reason": "short"}.'
@@ -498,7 +505,7 @@ class AgentLoop:
                 msg.chat_id,
                 exc,
             )
-            return False
+            return False, ""
 
         should_reply, confidence, reason = self._parse_reply_gate_decision(response.content)
         approved = should_reply and confidence >= confidence_threshold
@@ -523,13 +530,48 @@ class AgentLoop:
             action_request,
             reason or "-",
         )
-        return approved
+        return approved, reason
 
     def _effective_session_key(self, msg: InboundMessage) -> str:
         """Return the session key used for task routing and mid-turn injections."""
         if self._unified_session and not msg.session_key_override:
             return UNIFIED_SESSION_KEY
         return msg.session_key
+
+    async def _post_coordination_claim(
+        self,
+        msg: InboundMessage,
+        reason: str = "",
+    ) -> None:
+        """Post a brief public coordination claim to the open channel.
+
+        When multiple bots share a Slack channel, this announces in the thread
+        that this bot is taking on the request so other bots can see the claim
+        and stand down rather than duplicating the response.
+        """
+        slack_meta = (msg.metadata or {}).get("slack", {})
+        # Build a human-readable claim, omitting internal arbiter noise
+        _internal_reasons = {"empty arbiter response", "unparseable arbiter response"}
+        clean_reason = reason if reason and reason not in _internal_reasons else ""
+        content = f"I'll take care of this. _{clean_reason}_" if clean_reason else "I'll take care of this."
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=content,
+            metadata={
+                "slack": {
+                    "thread_ts": slack_meta.get("thread_ts"),
+                    "channel_type": slack_meta.get("channel_type"),
+                },
+                "_coordination_claim": True,
+            },
+        ))
+        logger.info(
+            "Posted coordination claim for {}:{}: {}",
+            msg.channel,
+            msg.chat_id,
+            content[:80],
+        )
 
     async def _run_agent_loop(
         self,
@@ -864,13 +906,18 @@ class AgentLoop:
         if result := await self.commands.dispatch(ctx):
             return result
 
-        if not await self._should_reply_to_inbound(msg, session):
+        approved, arbiter_reason = await self._should_reply_to_inbound(msg, session)
+        if not approved:
             logger.info("Skipping reply to {}:{} after smart reply gate", msg.channel, msg.sender_id)
             return None
 
-        await self.consolidator.maybe_consolidate_by_tokens(session)
+        # For action requests in a shared channel (smart mode), announce this bot
+        # is taking on the request in the open channel so other bots can see the
+        # claim and stand down, keeping all coordination publicly visible.
+        if self._needs_reply_gate(msg) and self._looks_like_action_request(msg.content):
+            await self._post_coordination_claim(msg, arbiter_reason)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        await self.consolidator.maybe_consolidate_by_tokens(session)
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()

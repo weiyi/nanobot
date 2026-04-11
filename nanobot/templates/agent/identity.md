@@ -24,6 +24,11 @@ This conversation is via email. Structure with clear sections. Markdown may not 
 {% elif channel == 'cli' or channel == 'mochat' %}
 ## Format Hint
 Output is rendered in a terminal. Avoid markdown headings and tables. Use plain text with minimal formatting.
+{% elif channel == 'slack' %}
+## Multi-Agent Coordination (Slack)
+When multiple bots share a Slack channel, only one should handle each request.
+- If you see another bot has posted "I'll take care of this" (a coordination claim) for the current request, **stop and do not duplicate their response**. Briefly acknowledge the handoff: e.g., "Deferring to @botname on this one."
+- Coordination claims and all negotiation must happen in the **open channel thread**, not via DMs, so the process is visible to everyone.
 {% endif %}
 
 ## Execution Rules

@@ -1585,7 +1585,177 @@ async def test_slack_smart_nonmention_gate_biases_toward_action_requests_when_ar
 
 
 @pytest.mark.asyncio
-async def test_runner_backfill_only_mutates_model_context_not_returned_messages():
+async def test_slack_smart_nonmention_gate_posts_coordination_claim_for_action_requests(tmp_path):
+    """When the arbiter approves an action request in a shared channel, a public
+    coordination claim should be posted to the channel before executing the task."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        LLMResponse(
+            content='{"should_reply": true, "confidence": 0.92, "reason": "deploy-related request"}',
+            tool_calls=[],
+            usage={},
+        ),
+        LLMResponse(content="Deployment looks good.", tool_calls=[], usage={}),
+    ])
+    provider.chat_stream_with_retry = AsyncMock(
+        return_value=LLMResponse(content="Deployment looks good.", tool_calls=[], usage={})
+    )
+
+    bus = MessageBus()
+    outbound_messages: list = []
+
+    async def _capture_outbound(msg):
+        outbound_messages.append(msg)
+
+    bus.publish_outbound = _capture_outbound  # type: ignore[method-assign]
+
+    loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    result = await loop._process_message(
+        InboundMessage(
+            channel="slack",
+            sender_id="U1",
+            chat_id="C1",
+            content="check the deployment status",
+            metadata={
+                "slack": {
+                    "channel_type": "channel",
+                    "thread_ts": "1700000000.000100",
+                    "group_policy": "smart",
+                    "smart_enabled": True,
+                    "was_directly_mentioned": False,
+                    "smart_confidence_threshold": 0.7,
+                }
+            },
+        )
+    )
+
+    # The final response should be returned normally.
+    assert result is not None
+    assert result.content == "Deployment looks good."
+
+    # A coordination claim must have been published to the channel before the response.
+    claim_msgs = [m for m in outbound_messages if (m.metadata or {}).get("_coordination_claim")]
+    assert len(claim_msgs) == 1
+    claim = claim_msgs[0]
+    assert claim.channel == "slack"
+    assert claim.chat_id == "C1"
+    assert "I'll take care of this" in claim.content
+    # The claim must carry the thread_ts so it posts in the correct thread.
+    assert claim.metadata["slack"]["thread_ts"] == "1700000000.000100"
+
+
+@pytest.mark.asyncio
+async def test_slack_smart_nonmention_gate_no_coordination_claim_when_arbiter_declines(tmp_path):
+    """When the arbiter declines to reply, no coordination claim should be posted."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(
+        content='{"should_reply": false, "confidence": 0.95, "reason": "general chatter"}',
+        tool_calls=[],
+        usage={},
+    ))
+
+    bus = MessageBus()
+    outbound_messages: list = []
+
+    async def _capture_outbound(msg):
+        outbound_messages.append(msg)
+
+    bus.publish_outbound = _capture_outbound  # type: ignore[method-assign]
+
+    loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    result = await loop._process_message(
+        InboundMessage(
+            channel="slack",
+            sender_id="U1",
+            chat_id="C1",
+            content="check the logs",
+            metadata={
+                "slack": {
+                    "channel_type": "channel",
+                    "thread_ts": "1700000000.000200",
+                    "group_policy": "smart",
+                    "smart_enabled": True,
+                    "was_directly_mentioned": False,
+                    "smart_confidence_threshold": 0.7,
+                }
+            },
+        )
+    )
+
+    # Result should be None — arbiter declined.
+    assert result is None
+    # No coordination claim should have been posted.
+    claim_msgs = [m for m in outbound_messages if (m.metadata or {}).get("_coordination_claim")]
+    assert len(claim_msgs) == 0
+
+
+@pytest.mark.asyncio
+async def test_slack_smart_nonmention_gate_arbiter_prompt_describes_coordination_protocol(tmp_path):
+    """The arbiter LLM call should include the coordination protocol description so that
+    other bots' claims in thread history cause this bot to defer."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    captured_arbiter_messages: list = []
+
+    async def _capture(*, messages, **kwargs):
+        captured_arbiter_messages.extend(messages)
+        return LLMResponse(
+            content='{"should_reply": false, "confidence": 0.9, "reason": "another bot claimed it"}',
+            tool_calls=[],
+            usage={},
+        )
+
+    provider.chat_with_retry = _capture
+
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    await loop._process_message(
+        InboundMessage(
+            channel="slack",
+            sender_id="U1",
+            chat_id="C1",
+            content="find the latest release notes",
+            metadata={
+                "slack": {
+                    "channel_type": "channel",
+                    "group_policy": "smart",
+                    "smart_enabled": True,
+                    "was_directly_mentioned": False,
+                    "smart_confidence_threshold": 0.7,
+                }
+            },
+        )
+    )
+
+    system_prompt = next(
+        (m["content"] for m in captured_arbiter_messages if m.get("role") == "system"), ""
+    )
+    # The arbiter prompt must mention the coordination protocol so bots defer when
+    # another bot has already claimed the request.
+    assert "coordination" in system_prompt.lower() or "claim" in system_prompt.lower()
+    assert "stand down" in system_prompt.lower() or "defer" in system_prompt.lower()
     """Runner should repair orphaned tool calls for the model without rewriting result.messages."""
     from nanobot.agent.runner import AgentRunSpec, AgentRunner, _BACKFILL_CONTENT
 
