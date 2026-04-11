@@ -810,6 +810,30 @@ class AgentLoop:
             content[:80],
         )
 
+    async def _post_negotiation_progress(
+        self,
+        msg: InboundMessage,
+        content: str,
+    ) -> None:
+        """Post a visible progress update to the channel thread during negotiation.
+
+        These messages keep users informed about what the bots are doing so the
+        negotiation process is transparent rather than a silent wait.
+        """
+        slack_meta = (msg.metadata or {}).get("slack", {})
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=content,
+            metadata={
+                "slack": {
+                    "thread_ts": slack_meta.get("thread_ts"),
+                    "channel_type": slack_meta.get("channel_type"),
+                },
+                "_coordination_progress": True,
+            },
+        ))
+
     async def _run_coordination_negotiation(
         self,
         msg: InboundMessage,
@@ -820,9 +844,13 @@ class AgentLoop:
         """Run the full multi-bot negotiation flow.
 
         1. Post a capability bid to the thread.
-        2. Wait for other bots to post their bids (negotiation_timeout).
-        3. Evaluate all bids via LLM to select the best bot.
-        4. Post the selection result (claim or deferral).
+        2. Post a progress update so the user knows bots are deliberating.
+        3. Wait for other bots to post their bids (negotiation_timeout).
+        4. Evaluate all bids via LLM to select the best bot.
+        5. Post the selection result (claim or deferral).
+
+        All phases post visible messages to the channel thread so the user
+        can follow along instead of waiting without feedback.
 
         Returns True if this bot should proceed with the task, False to defer.
 
@@ -843,7 +871,12 @@ class AgentLoop:
         # Phase 1: Post capability bid
         await self._post_coordination_bid(msg, arbiter_reason)
 
-        # Phase 2: Wait for other bots' bids
+        # Phase 2: Notify the user that bots are deliberating
+        await self._post_negotiation_progress(
+            msg, "🤖 Checking with the team to find the best bot for this…"
+        )
+
+        # Phase 3: Wait for other bots' bids
         other_bids = await self._collect_negotiation_bids(
             pending_queue, timeout=negotiation_timeout
         )
@@ -855,15 +888,24 @@ class AgentLoop:
                 msg.channel,
                 msg.chat_id,
             )
-            await self._post_coordination_selection(msg, selected=True, reason="sole bidder")
+            await self._post_coordination_selection(
+                msg, selected=True, reason="no other bots bid — starting now"
+            )
             return True
 
-        # Phase 3: Evaluate all bids and select the best bot
+        # Phase 4: Notify user that bids are being evaluated
+        bid_count = len(other_bids) + 1  # include self
+        await self._post_negotiation_progress(
+            msg,
+            f"🗳️ {bid_count} bots have offered to help — evaluating who's best suited…",
+        )
+
+        # Phase 5: Evaluate all bids and select the best bot
         selected, selection_reason = await self._select_from_negotiation(
             msg, arbiter_reason, other_bids, session
         )
 
-        # Phase 4: Post the selection result
+        # Phase 6: Post the selection result
         await self._post_coordination_selection(msg, selected=selected, reason=selection_reason)
 
         if not selected:

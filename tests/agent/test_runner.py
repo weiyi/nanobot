@@ -2791,7 +2791,7 @@ async def test_negotiation_posts_bid_then_claim_as_sole_bidder(tmp_path):
     # Bid should contain the arbiter's capability reason
     assert "has deployment tools" in bid_msgs[0].content
     assert "I'll take care of this" in claim_msgs[0].content
-    assert "sole bidder" in claim_msgs[0].content
+    assert "no other bots bid" in claim_msgs[0].content
 
 
 @pytest.mark.asyncio
@@ -3327,3 +3327,251 @@ async def test_collect_negotiation_bids_returns_empty_with_zero_timeout(tmp_path
     pending = asyncio.Queue(maxsize=20)
     bids = await loop._collect_negotiation_bids(pending, timeout=0)
     assert bids == []
+
+
+@pytest.mark.asyncio
+async def test_negotiation_posts_progress_messages_during_deliberation(tmp_path):
+    """The negotiation flow should post visible progress messages to the channel
+    so users can follow along during the deliberation window."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        # Arbiter response
+        LLMResponse(
+            content='{"should_reply": true, "confidence": 0.92, "reason": "deployment specialist"}',
+            tool_calls=[],
+            usage={},
+        ),
+        # Main agent response
+        LLMResponse(content="Deployed.", tool_calls=[], usage={}),
+    ])
+    provider.chat_stream_with_retry = AsyncMock(
+        return_value=LLMResponse(content="Deployed.", tool_calls=[], usage={})
+    )
+
+    bus = MessageBus()
+    outbound_messages: list = []
+
+    async def _capture_outbound(msg):
+        outbound_messages.append(msg)
+
+    bus.publish_outbound = _capture_outbound
+
+    loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)
+
+    pending = asyncio.Queue(maxsize=20)
+    result = await loop._process_message(
+        InboundMessage(
+            channel="slack",
+            sender_id="U1",
+            chat_id="C1",
+            content="check the deployment status",
+            metadata={
+                "slack": {
+                    "channel_type": "channel",
+                    "thread_ts": "1700000000.000100",
+                    "group_policy": "smart",
+                    "smart_enabled": True,
+                    "was_directly_mentioned": False,
+                    "smart_confidence_threshold": 0.7,
+                    "negotiation_timeout": 0.1,
+                }
+            },
+        ),
+        pending_queue=pending,
+    )
+
+    assert result is not None
+
+    # There should be a progress message ("Checking with the team") between bid and claim
+    progress_msgs = [
+        m for m in outbound_messages
+        if (m.metadata or {}).get("_coordination_progress")
+    ]
+    assert len(progress_msgs) >= 1
+    assert "Checking with the team" in progress_msgs[0].content
+    # Progress message should be posted to the same thread
+    assert progress_msgs[0].metadata["slack"]["thread_ts"] == "1700000000.000100"
+
+    # Verify message ordering: bid → progress → claim → response
+    bid_idx = next(
+        i for i, m in enumerate(outbound_messages)
+        if (m.metadata or {}).get("_coordination_bid")
+    )
+    progress_idx = next(
+        i for i, m in enumerate(outbound_messages)
+        if (m.metadata or {}).get("_coordination_progress")
+    )
+    claim_idx = next(
+        i for i, m in enumerate(outbound_messages)
+        if (m.metadata or {}).get("_coordination_claim")
+    )
+    assert bid_idx < progress_idx < claim_idx
+
+
+@pytest.mark.asyncio
+async def test_negotiation_posts_evaluation_progress_when_multiple_bids(tmp_path):
+    """When multiple bots bid, the negotiation should post an evaluation progress
+    message showing how many bots offered to help."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        # Arbiter response
+        LLMResponse(
+            content='{"should_reply": true, "confidence": 0.9, "reason": "code review"}',
+            tool_calls=[],
+            usage={},
+        ),
+        # Selection response
+        LLMResponse(
+            content='{"select_self": true, "reason": "best suited for code review"}',
+            tool_calls=[],
+            usage={},
+        ),
+        # Main agent response
+        LLMResponse(content="Code looks good.", tool_calls=[], usage={}),
+    ])
+    provider.chat_stream_with_retry = AsyncMock(
+        return_value=LLMResponse(content="Code looks good.", tool_calls=[], usage={})
+    )
+
+    bus = MessageBus()
+    outbound_messages: list = []
+
+    async def _capture_outbound(msg):
+        outbound_messages.append(msg)
+
+    bus.publish_outbound = _capture_outbound
+
+    loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)
+
+    pending = asyncio.Queue(maxsize=20)
+    other_bot_bid = InboundMessage(
+        channel="slack",
+        sender_id="U_OTHER_BOT",
+        chat_id="C1",
+        content="[Bot message from <@U_OTHER_BOT>]\n📋 I could help with this — general monitoring",
+        metadata={
+            "slack": {
+                "channel_type": "channel",
+                "thread_ts": "1700000000.000100",
+                "is_bot_message": True,
+            }
+        },
+    )
+
+    async def _feed_bid():
+        await asyncio.sleep(0.02)
+        await pending.put(other_bot_bid)
+
+    feed_task = asyncio.create_task(_feed_bid())
+
+    result = await loop._process_message(
+        InboundMessage(
+            channel="slack",
+            sender_id="U1",
+            chat_id="C1",
+            content="review the code changes",
+            metadata={
+                "slack": {
+                    "channel_type": "channel",
+                    "thread_ts": "1700000000.000100",
+                    "group_policy": "smart",
+                    "smart_enabled": True,
+                    "was_directly_mentioned": False,
+                    "smart_confidence_threshold": 0.7,
+                    "negotiation_timeout": 0.2,
+                }
+            },
+        ),
+        pending_queue=pending,
+    )
+
+    await feed_task
+
+    assert result is not None
+
+    progress_msgs = [
+        m for m in outbound_messages
+        if (m.metadata or {}).get("_coordination_progress")
+    ]
+    # Should have 2 progress messages: "Checking with the team" + "N bots have offered"
+    assert len(progress_msgs) == 2
+    assert "Checking with the team" in progress_msgs[0].content
+    assert "2 bots have offered to help" in progress_msgs[1].content
+    assert "evaluating" in progress_msgs[1].content
+
+
+@pytest.mark.asyncio
+async def test_negotiation_no_progress_messages_in_legacy_mode(tmp_path):
+    """When negotiation_timeout=0 (legacy mode), no progress messages should be posted."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        # Arbiter response
+        LLMResponse(
+            content='{"should_reply": true, "confidence": 0.92, "reason": "deploy-related request"}',
+            tool_calls=[],
+            usage={},
+        ),
+        # Main agent response
+        LLMResponse(content="Done.", tool_calls=[], usage={}),
+    ])
+    provider.chat_stream_with_retry = AsyncMock(
+        return_value=LLMResponse(content="Done.", tool_calls=[], usage={})
+    )
+
+    bus = MessageBus()
+    outbound_messages: list = []
+
+    async def _capture_outbound(msg):
+        outbound_messages.append(msg)
+
+    bus.publish_outbound = _capture_outbound
+
+    loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)
+
+    await loop._process_message(
+        InboundMessage(
+            channel="slack",
+            sender_id="U1",
+            chat_id="C1",
+            content="check the logs",
+            metadata={
+                "slack": {
+                    "channel_type": "channel",
+                    "thread_ts": "1700000000.000300",
+                    "group_policy": "smart",
+                    "smart_enabled": True,
+                    "was_directly_mentioned": False,
+                    "smart_confidence_threshold": 0.7,
+                    "negotiation_timeout": 0,  # legacy mode
+                }
+            },
+        )
+    )
+
+    # No progress messages in legacy mode
+    progress_msgs = [
+        m for m in outbound_messages
+        if (m.metadata or {}).get("_coordination_progress")
+    ]
+    assert len(progress_msgs) == 0
