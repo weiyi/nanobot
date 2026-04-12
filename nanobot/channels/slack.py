@@ -11,7 +11,7 @@ from slack_sdk.socket_mode.websockets import SocketModeClient
 from slack_sdk.web.async_client import AsyncWebClient
 from slackify_markdown import slackify_markdown
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from pydantic import Field
 
@@ -339,6 +339,50 @@ class SlackChannel(BaseChannel):
             )
         except Exception:
             logger.exception("Error handling Slack message from {}", sender_id)
+
+    async def _handle_message(
+        self,
+        sender_id: str,
+        chat_id: str,
+        content: str,
+        media: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        session_key: str | None = None,
+    ) -> None:
+        """Override base to bypass global allow check for bot messages.
+
+        Bot messages in shared channels have already passed Slack-specific
+        access control (_is_allowed).  The global ``is_allowed()`` check in
+        ``BaseChannel`` would reject them when the other bot's user-id is not
+        in ``allow_from`` — silently dropping coordination bids/claims and
+        preventing multi-bot negotiation from working.
+        """
+        slack_meta = (metadata or {}).get("slack", {})
+        if not slack_meta.get("is_bot_message"):
+            return await super()._handle_message(
+                sender_id=sender_id,
+                chat_id=chat_id,
+                content=content,
+                media=media,
+                metadata=metadata,
+                session_key=session_key,
+            )
+
+        # Bot messages: skip is_allowed, build InboundMessage directly.
+        meta = metadata or {}
+        if self.supports_streaming:
+            meta = {**meta, "_wants_stream": True}
+
+        msg = InboundMessage(
+            channel=self.name,
+            sender_id=str(sender_id),
+            chat_id=str(chat_id),
+            content=content,
+            media=media or [],
+            metadata=meta,
+            session_key_override=session_key,
+        )
+        await self.bus.publish_inbound(msg)
 
     async def _update_react_emoji(self, chat_id: str, ts: str | None) -> None:
         """Remove the in-progress reaction and optionally add a done reaction."""
