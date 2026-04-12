@@ -3966,10 +3966,9 @@ async def test_negotiation_verification_catches_late_bid(tmp_path):
     pending = asyncio.Queue(maxsize=20)
 
     # Feed a bid that arrives AFTER the main collection window but during
-    # the verification window.  The main timeout is 0.1s, verification
-    # is min(1.5, 0.1 * 0.25) = 0.025s.  We need the bid to arrive
-    # between 0.1s and 0.1 + 0.025s.  To make this reliable, we'll use
-    # a very short main timeout and feed the bid just after.
+    # the verification window.  Use a larger negotiation_timeout (0.3s) so
+    # the verification window (min(1.5, 0.3 * 0.25) = 0.075s) gives
+    # comfortable margin after the main collection ends.
     late_bid = InboundMessage(
         channel="slack",
         sender_id="U_LATE_BOT",
@@ -3979,8 +3978,9 @@ async def test_negotiation_verification_catches_late_bid(tmp_path):
     )
 
     async def _feed_late_bid():
-        # Wait longer than main collection but within verification window
-        await asyncio.sleep(0.12)
+        # Wait longer than main collection (0.3s) but within verification
+        # window (ends at ~0.375s).
+        await asyncio.sleep(0.32)
         await pending.put(late_bid)
 
     feed_task = asyncio.create_task(_feed_late_bid())
@@ -4001,7 +4001,7 @@ async def test_negotiation_verification_catches_late_bid(tmp_path):
                         "smart_enabled": True,
                         "was_directly_mentioned": False,
                         "smart_confidence_threshold": 0.7,
-                        "negotiation_timeout": 0.1,
+                        "negotiation_timeout": 0.3,
                     }
                 },
             ),
