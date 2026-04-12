@@ -1587,7 +1587,7 @@ async def test_slack_smart_nonmention_gate_biases_toward_action_requests_when_ar
 @pytest.mark.asyncio
 async def test_slack_smart_nonmention_gate_posts_coordination_claim_for_action_requests(tmp_path):
     """When the arbiter approves an action request in a shared channel, a public
-    coordination claim should be posted to the channel before executing the task."""
+    coordination bid should be posted to the channel before executing the task."""
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.events import InboundMessage
     from nanobot.bus.queue import MessageBus
@@ -1641,15 +1641,17 @@ async def test_slack_smart_nonmention_gate_posts_coordination_claim_for_action_r
     assert result is not None
     assert result.content == "Deployment looks good."
 
-    # A coordination claim must have been published to the channel before the response.
-    claim_msgs = [m for m in outbound_messages if (m.metadata or {}).get("_coordination_claim")]
-    assert len(claim_msgs) == 1
-    claim = claim_msgs[0]
-    assert claim.channel == "slack"
-    assert claim.chat_id == "C1"
-    assert "I'll take care of this" in claim.content
-    # The claim must carry the thread_ts so it posts in the correct thread.
-    assert claim.metadata["slack"]["thread_ts"] == "1700000000.000100"
+    # A coordination bid must have been published to the channel before the response.
+    # The sole-bidder path no longer posts a separate claim, so the bid
+    # serves as the public coordination signal.
+    bid_msgs = [m for m in outbound_messages if (m.metadata or {}).get("_coordination_bid")]
+    assert len(bid_msgs) == 1
+    bid = bid_msgs[0]
+    assert bid.channel == "slack"
+    assert bid.chat_id == "C1"
+    assert "📋" in bid.content
+    # The bid must carry the thread_ts so it posts in the correct thread.
+    assert bid.metadata["slack"]["thread_ts"] == "1700000000.000100"
 
 
 @pytest.mark.asyncio
@@ -2782,17 +2784,14 @@ async def test_negotiation_posts_bid_then_claim_as_sole_bidder(tmp_path):
     assert result is not None
     assert result.content == "Deployment looks good."
 
-    # Should have a bid message AND a claim message
+    # Should have a bid message but NO separate claim (sole-bidder skips claim)
     bid_msgs = [m for m in outbound_messages if (m.metadata or {}).get("_coordination_bid")]
     claim_msgs = [m for m in outbound_messages if (m.metadata or {}).get("_coordination_claim")]
     assert len(bid_msgs) == 1
-    assert len(claim_msgs) == 1
+    assert len(claim_msgs) == 0
     assert "📋" in bid_msgs[0].content
     # Bid should contain the arbiter's capability reason
     assert "has deployment tools" in bid_msgs[0].content
-    assert "I'll take care of this" in claim_msgs[0].content
-    assert "no other bots bid" in claim_msgs[0].content
-    assert "starting now" in claim_msgs[0].content
 
 
 @pytest.mark.asyncio
@@ -3311,8 +3310,9 @@ async def test_collect_negotiation_bids_returns_empty_with_no_queue(tmp_path):
     provider.get_default_model.return_value = "test-model"
     loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
 
-    bids = await loop._collect_negotiation_bids(None, timeout=1.0)
+    bids, claim_detected = await loop._collect_negotiation_bids(None, timeout=1.0)
     assert bids == []
+    assert claim_detected is False
 
 
 @pytest.mark.asyncio
@@ -3326,8 +3326,9 @@ async def test_collect_negotiation_bids_returns_empty_with_zero_timeout(tmp_path
     loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
 
     pending = asyncio.Queue(maxsize=20)
-    bids = await loop._collect_negotiation_bids(pending, timeout=0)
+    bids, claim_detected = await loop._collect_negotiation_bids(pending, timeout=0)
     assert bids == []
+    assert claim_detected is False
 
 
 @pytest.mark.asyncio
@@ -3400,7 +3401,7 @@ async def test_negotiation_posts_progress_messages_during_deliberation(tmp_path)
     # Progress message should be posted to the same thread
     assert progress_msgs[0].metadata["slack"]["thread_ts"] == "1700000000.000100"
 
-    # Verify message ordering: bid → progress → claim → response
+    # Verify message ordering: bid → progress → response (sole-bidder skips claim)
     bid_idx = next(
         i for i, m in enumerate(outbound_messages)
         if (m.metadata or {}).get("_coordination_bid")
@@ -3409,11 +3410,10 @@ async def test_negotiation_posts_progress_messages_during_deliberation(tmp_path)
         i for i, m in enumerate(outbound_messages)
         if (m.metadata or {}).get("_coordination_progress")
     )
-    claim_idx = next(
-        i for i, m in enumerate(outbound_messages)
-        if (m.metadata or {}).get("_coordination_claim")
-    )
-    assert bid_idx < progress_idx < claim_idx
+    # No separate claim in sole-bidder path
+    claim_msgs = [m for m in outbound_messages if (m.metadata or {}).get("_coordination_claim")]
+    assert len(claim_msgs) == 0
+    assert bid_idx < progress_idx
 
 
 @pytest.mark.asyncio
@@ -3576,3 +3576,184 @@ async def test_negotiation_no_progress_messages_in_legacy_mode(tmp_path):
         if (m.metadata or {}).get("_coordination_progress")
     ]
     assert len(progress_msgs) == 0
+
+
+@pytest.mark.asyncio
+async def test_negotiation_defers_when_claim_detected_during_collection(tmp_path):
+    """When another bot's claim message arrives during the bid collection window,
+    this bot should detect it and defer instead of also claiming."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        # Arbiter response
+        LLMResponse(
+            content='{"should_reply": true, "confidence": 0.9, "reason": "can help"}',
+            tool_calls=[],
+            usage={},
+        ),
+    ])
+
+    bus = MessageBus()
+    outbound_messages: list = []
+
+    async def _capture_outbound(msg):
+        outbound_messages.append(msg)
+
+    bus.publish_outbound = _capture_outbound
+
+    loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)
+
+    pending = asyncio.Queue(maxsize=20)
+    # Simulate another bot's claim arriving during the collection window
+    claim_msg = InboundMessage(
+        channel="slack",
+        sender_id="U_OTHER_BOT",
+        chat_id="C1",
+        content="[Bot message from <@U_OTHER_BOT>]\nBased on our discussion, I'll take care of this. _deployment specialist_",
+        metadata={
+            "slack": {
+                "channel_type": "channel",
+                "thread_ts": "1700000000.000100",
+                "is_bot_message": True,
+            }
+        },
+    )
+
+    async def _feed_claim():
+        await asyncio.sleep(0.02)
+        await pending.put(claim_msg)
+
+    feed_task = asyncio.create_task(_feed_claim())
+
+    result = await loop._process_message(
+        InboundMessage(
+            channel="slack",
+            sender_id="U1",
+            chat_id="C1",
+            content="check the deployment status",
+            metadata={
+                "slack": {
+                    "channel_type": "channel",
+                    "thread_ts": "1700000000.000100",
+                    "group_policy": "smart",
+                    "smart_enabled": True,
+                    "was_directly_mentioned": False,
+                    "smart_confidence_threshold": 0.7,
+                    "negotiation_timeout": 0.2,
+                }
+            },
+        ),
+        pending_queue=pending,
+    )
+
+    await feed_task
+
+    # Bot should have deferred — no task response
+    assert result is None
+
+    # Should have a bid and a deferral, but NOT a claim
+    bid_msgs = [m for m in outbound_messages if (m.metadata or {}).get("_coordination_bid")]
+    deferral_msgs = [m for m in outbound_messages if (m.metadata or {}).get("_coordination_deferral")]
+    claim_msgs = [m for m in outbound_messages if (m.metadata or {}).get("_coordination_claim")]
+    assert len(bid_msgs) == 1
+    assert len(deferral_msgs) == 1
+    assert len(claim_msgs) == 0
+    assert "another bot already claimed" in deferral_msgs[0].content
+
+
+@pytest.mark.asyncio
+async def test_negotiation_bid_cleans_action_request_bias_reason(tmp_path):
+    """When the arbiter returns an empty/unparseable response and action-request
+    bias kicks in, the bid message should not leak internal reason text."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        # Arbiter returns empty → action-request bias overrides
+        LLMResponse(content="", tool_calls=[], usage={}),
+        # Main agent response
+        LLMResponse(content="Done.", tool_calls=[], usage={}),
+    ])
+    provider.chat_stream_with_retry = AsyncMock(
+        return_value=LLMResponse(content="Done.", tool_calls=[], usage={})
+    )
+
+    bus = MessageBus()
+    outbound_messages: list = []
+
+    async def _capture_outbound(msg):
+        outbound_messages.append(msg)
+
+    bus.publish_outbound = _capture_outbound
+
+    loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)
+
+    pending = asyncio.Queue(maxsize=20)
+    await loop._process_message(
+        InboundMessage(
+            channel="slack",
+            sender_id="U1",
+            chat_id="C1",
+            content="check the deployment status",
+            metadata={
+                "slack": {
+                    "channel_type": "channel",
+                    "thread_ts": "1700000000.000100",
+                    "group_policy": "smart",
+                    "smart_enabled": True,
+                    "was_directly_mentioned": False,
+                    "smart_confidence_threshold": 0.7,
+                    "negotiation_timeout": 0.1,
+                }
+            },
+        ),
+        pending_queue=pending,
+    )
+
+    bid_msgs = [m for m in outbound_messages if (m.metadata or {}).get("_coordination_bid")]
+    assert len(bid_msgs) == 1
+    # Internal reasons should NOT appear in the public bid message
+    assert "empty arbiter response" not in bid_msgs[0].content
+    assert "action-request bias" not in bid_msgs[0].content
+    # Bid should be the clean fallback
+    assert bid_msgs[0].content == "📋 I could help with this."
+
+
+@pytest.mark.asyncio
+async def test_collect_negotiation_bids_detects_claim_messages(tmp_path):
+    """_collect_negotiation_bids should detect coordination claims from other bots
+    and return claim_detected=True while still re-queuing the claim message."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+
+    pending = asyncio.Queue(maxsize=20)
+    claim_msg = InboundMessage(
+        channel="slack",
+        sender_id="U_OTHER",
+        chat_id="C1",
+        content="[Bot message from <@U_OTHER>]\nI'll take care of this. _deployment specialist_",
+        metadata={"slack": {"is_bot_message": True}},
+    )
+    await pending.put(claim_msg)
+
+    bids, claim_detected = await loop._collect_negotiation_bids(pending, timeout=0.1)
+    assert bids == []
+    assert claim_detected is True
+    # Claim message should have been re-queued
+    assert not pending.empty()

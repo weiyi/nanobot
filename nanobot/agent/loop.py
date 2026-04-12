@@ -557,7 +557,8 @@ class AgentLoop:
         slack_meta = (msg.metadata or {}).get("slack", {})
         # Build a human-readable claim, omitting internal arbiter noise
         _internal_reasons = {"empty arbiter response", "unparseable arbiter response"}
-        clean_reason = reason if reason and reason not in _internal_reasons else ""
+        is_internal = not reason or any(ir in reason for ir in _internal_reasons)
+        clean_reason = "" if is_internal else reason
         content = f"I'll take care of this. _{clean_reason}_" if clean_reason else "I'll take care of this."
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel,
@@ -595,7 +596,8 @@ class AgentLoop:
         """
         slack_meta = (msg.metadata or {}).get("slack", {})
         _internal_reasons = {"empty arbiter response", "unparseable arbiter response"}
-        clean_reason = reason if reason and reason not in _internal_reasons else ""
+        is_internal = not reason or any(ir in reason for ir in _internal_reasons)
+        clean_reason = "" if is_internal else reason
         content = (
             f"📋 I could help with this — {clean_reason}"
             if clean_reason
@@ -624,17 +626,20 @@ class AgentLoop:
         self,
         pending_queue: asyncio.Queue | None,
         timeout: float = 5.0,
-    ) -> list[InboundMessage]:
+    ) -> tuple[list[InboundMessage], bool]:
         """Wait for *timeout* seconds, collecting bot bid messages from the pending queue.
 
         Non-bid messages are preserved and re-queued so they are not lost.
-        Returns a list of bid messages from other bots.
+        Returns ``(bids, claim_detected)`` where *bids* is a list of bid
+        messages from other bots and *claim_detected* is True when another
+        bot already posted a coordination claim during the collection window.
         """
         if pending_queue is None or timeout <= 0:
-            return []
+            return [], False
 
         bids: list[InboundMessage] = []
         non_bid_messages: list[InboundMessage] = []
+        claim_detected = False
         deadline = time.monotonic() + timeout
 
         while time.monotonic() < deadline:
@@ -654,8 +659,21 @@ class AgentLoop:
             # so we check if the bid marker appears anywhere in the content.
             slack_meta = (queued_msg.metadata or {}).get("slack", {})
             is_bot = bool(slack_meta.get("is_bot_message"))
-            has_bid_marker = "📋" in (queued_msg.content or "")
-            if is_bot and has_bid_marker:
+            content = queued_msg.content or ""
+            has_bid_marker = "📋" in content
+            # Also detect claim messages from other bots so we can defer
+            # immediately instead of duplicating the response.
+            has_claim = is_bot and "I'll take care of this" in content
+            if has_claim:
+                claim_detected = True
+                logger.info(
+                    "Detected coordination claim from {} during bid collection in {}:{}",
+                    queued_msg.sender_id,
+                    queued_msg.channel,
+                    queued_msg.chat_id,
+                )
+                non_bid_messages.append(queued_msg)
+            elif is_bot and has_bid_marker:
                 bids.append(queued_msg)
                 logger.info(
                     "Collected negotiation bid from {} in {}:{}",
@@ -676,7 +694,7 @@ class AgentLoop:
                 )
                 await self.bus.publish_inbound(preserved)
 
-        return bids
+        return bids, claim_detected
 
     async def _select_from_negotiation(
         self,
@@ -876,20 +894,33 @@ class AgentLoop:
             msg, "🤖 Checking with the team to find the best bot for this…"
         )
 
-        # Phase 3: Wait for other bots' bids
-        other_bids = await self._collect_negotiation_bids(
+        # Phase 3: Wait for other bots' bids (and detect claims)
+        other_bids, claim_detected = await self._collect_negotiation_bids(
             pending_queue, timeout=negotiation_timeout
         )
 
-        # If no other bots bid, proceed without full selection (sole bidder wins)
+        # If another bot already posted a coordination claim during
+        # the collection window, defer immediately to avoid duplicating work.
+        if claim_detected:
+            logger.info(
+                "Another bot already claimed {}:{}; deferring",
+                msg.channel,
+                msg.chat_id,
+            )
+            await self._post_coordination_selection(
+                msg, selected=False, reason="another bot already claimed this"
+            )
+            return False
+
+        # If no other bots bid, proceed as sole bidder without posting
+        # a separate claim message — the bid already signals intent and
+        # an extra claim would only add noise when both bots in a shared
+        # channel independently determine they are the sole bidder.
         if not other_bids:
             logger.info(
                 "No other bids received for {}:{}; proceeding as sole bidder",
                 msg.channel,
                 msg.chat_id,
-            )
-            await self._post_coordination_selection(
-                msg, selected=True, reason="no other bots bid — starting now"
             )
             return True
 
