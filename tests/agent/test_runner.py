@@ -3757,3 +3757,105 @@ async def test_collect_negotiation_bids_detects_claim_messages(tmp_path):
     assert claim_detected is True
     # Claim message should have been re-queued
     assert not pending.empty()
+
+
+class TestLooksLikeActionRequestOpenQuestions:
+    """_looks_like_action_request should match open questions so bots don't
+    ignore them entirely."""
+
+    @staticmethod
+    def _check(text: str) -> bool:
+        from nanobot.agent.loop import AgentLoop
+        return AgentLoop._looks_like_action_request(text)
+
+    def test_what_question(self):
+        assert self._check("what is the best method to pull the latest nanobot and restart the agents?")
+
+    def test_how_question(self):
+        assert self._check("how do I deploy the new version?")
+
+    def test_why_question(self):
+        assert self._check("why is the build failing?")
+
+    def test_where_question(self):
+        assert self._check("where are the deployment logs stored?")
+
+    def test_when_question(self):
+        assert self._check("when was the last deployment?")
+
+    def test_who_question(self):
+        assert self._check("who has access to the production cluster?")
+
+    def test_which_question(self):
+        assert self._check("which service is causing the outage?")
+
+    def test_hey_what_question(self):
+        assert self._check("hey what is the deploy status?")
+
+    def test_question_mark_with_question_word_mid_sentence(self):
+        assert self._check("does anyone know what the deploy status is?")
+
+    def test_plain_chatter_not_matched(self):
+        assert not self._check("just chatting")
+
+    def test_empty_string_not_matched(self):
+        assert not self._check("")
+
+    def test_none_not_matched(self):
+        assert not self._check(None)
+
+    def test_existing_prefixes_still_work(self):
+        assert self._check("check the deployment status")
+        assert self._check("can you review this PR?")
+
+
+@pytest.mark.asyncio
+async def test_slack_smart_nonmention_gate_biases_toward_open_questions(tmp_path):
+    """When the arbiter declines an open question (should_reply=false) the
+    action-request bias should override and approve the message."""
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.bus.events import InboundMessage
+    from nanobot.bus.queue import MessageBus
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat_with_retry = AsyncMock(side_effect=[
+        # Arbiter wrongly declines the open question
+        LLMResponse(
+            content='{"should_reply": false, "confidence": 0.6, "reason": "not sure"}',
+            tool_calls=[],
+            usage={},
+        ),
+        # Main agent response
+        LLMResponse(content="You can pull the latest nanobot with git pull.", tool_calls=[], usage={}),
+    ])
+    provider.chat_stream_with_retry = AsyncMock(
+        return_value=LLMResponse(content="You can pull the latest nanobot with git pull.", tool_calls=[], usage={})
+    )
+
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    loop.tools.get_definitions = MagicMock(return_value=[])
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    result = await loop._process_message(
+        InboundMessage(
+            channel="slack",
+            sender_id="U1",
+            chat_id="C1",
+            content="what is the best method to pull the latest nanobot and restart the agents?",
+            metadata={
+                "slack": {
+                    "channel_type": "channel",
+                    "group_policy": "smart",
+                    "smart_enabled": True,
+                    "was_directly_mentioned": False,
+                    "smart_confidence_threshold": 0.7,
+                }
+            },
+        )
+    )
+
+    assert result is not None
+    assert result.content == "You can pull the latest nanobot with git pull."
+    # Arbiter call + main agent call
+    assert provider.chat_with_retry.await_count == 2
