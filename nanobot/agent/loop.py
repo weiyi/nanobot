@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import random
 import re
 import time
 from contextlib import AsyncExitStack, nullcontext
@@ -622,6 +623,51 @@ class AgentLoop:
             content[:80],
         )
 
+    @staticmethod
+    def _drain_pending_bids(
+        pending_queue: asyncio.Queue | None,
+    ) -> tuple[list[InboundMessage], bool]:
+        """Non-blocking drain of the pending queue for bid/claim messages.
+
+        Returns ``(bids, claim_detected)`` with any coordination messages
+        already waiting in the queue.  Non-coordination messages are put
+        back so they are not lost.
+        """
+        if pending_queue is None:
+            return [], False
+
+        bids: list[InboundMessage] = []
+        non_bid: list[InboundMessage] = []
+        claim_detected = False
+
+        while True:
+            try:
+                queued_msg = pending_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            slack_meta = (queued_msg.metadata or {}).get("slack", {})
+            is_bot = bool(slack_meta.get("is_bot_message"))
+            content = queued_msg.content or ""
+            has_bid_marker = "📋" in content
+            has_claim = is_bot and "I'll take care of this" in content
+
+            if has_claim:
+                claim_detected = True
+                non_bid.append(queued_msg)
+            elif is_bot and has_bid_marker:
+                bids.append(queued_msg)
+            else:
+                non_bid.append(queued_msg)
+
+        for preserved in non_bid:
+            try:
+                pending_queue.put_nowait(preserved)
+            except asyncio.QueueFull:
+                pass
+
+        return bids, claim_detected
+
     async def _collect_negotiation_bids(
         self,
         pending_queue: asyncio.Queue | None,
@@ -861,11 +907,13 @@ class AgentLoop:
     ) -> bool:
         """Run the full multi-bot negotiation flow.
 
-        1. Post a capability bid to the thread.
-        2. Post a progress update so the user knows bots are deliberating.
-        3. Wait for other bots to post their bids (negotiation_timeout).
-        4. Evaluate all bids via LLM to select the best bot.
-        5. Post the selection result (claim or deferral).
+        1. Random jitter to desynchronize competing bots.
+        2. Check for early bids/claims that arrived while the arbiter was running.
+        3. Post a capability bid to the thread.
+        4. Post a progress update so the user knows bots are deliberating.
+        5. Wait for other bots to post their bids (negotiation_timeout).
+        6. Evaluate all bids via LLM to select the best bot.
+        7. Post the selection result (claim or deferral).
 
         All phases post visible messages to the channel thread so the user
         can follow along instead of waiting without feedback.
@@ -886,6 +934,31 @@ class AgentLoop:
             await self._post_coordination_claim(msg, arbiter_reason)
             return True
 
+        # Phase 0: Random jitter to desynchronize multiple bots.
+        # Without jitter both bots post bids at nearly the same instant and
+        # each one's bid may not arrive at the other before the collection
+        # window closes.  A small random delay ensures one bot posts first,
+        # giving the other a clear signal to detect.
+        jitter = random.uniform(0, min(negotiation_timeout * 0.3, 1.5))
+        if jitter > 0.05:
+            await asyncio.sleep(jitter)
+
+        # Phase 0b: Check for early bids/claims that may have arrived in the
+        # pending queue while the arbiter LLM call was running (the other bot
+        # may have posted its bid faster due to a shorter jitter or a faster
+        # arbiter response).
+        early_bids, early_claim = self._drain_pending_bids(pending_queue)
+        if early_claim:
+            logger.info(
+                "Detected early claim for {}:{}; deferring before bidding",
+                msg.channel,
+                msg.chat_id,
+            )
+            await self._post_coordination_selection(
+                msg, selected=False, reason="another bot already claimed this"
+            )
+            return False
+
         # Phase 1: Post capability bid
         await self._post_coordination_bid(msg, arbiter_reason)
 
@@ -894,10 +967,16 @@ class AgentLoop:
             msg, "🤖 Checking with the team to find the best bot for this…"
         )
 
-        # Phase 3: Wait for other bots' bids (and detect claims)
+        # Phase 3: Wait for other bots' bids (and detect claims).
+        # Subtract the jitter from the timeout so the total wall-clock time
+        # stays roughly constant regardless of the jitter drawn.
+        collect_timeout = max(negotiation_timeout - jitter, negotiation_timeout * 0.5)
         other_bids, claim_detected = await self._collect_negotiation_bids(
-            pending_queue, timeout=negotiation_timeout
+            pending_queue, timeout=collect_timeout
         )
+
+        # Include any bids collected in Phase 0b
+        other_bids = early_bids + other_bids
 
         # If another bot already posted a coordination claim during
         # the collection window, defer immediately to avoid duplicating work.
@@ -912,17 +991,35 @@ class AgentLoop:
             )
             return False
 
-        # If no other bots bid, proceed as sole bidder without posting
-        # a separate claim message — the bid already signals intent and
-        # an extra claim would only add noise when both bots in a shared
-        # channel independently determine they are the sole bidder.
+        # If no other bots bid, run a short verification window before
+        # proceeding.  This catches late-arriving bids/claims that were
+        # in-flight when the main collection window closed — e.g. Slack
+        # message delivery jitter or event-loop scheduling delays.
         if not other_bids:
-            logger.info(
-                "No other bids received for {}:{}; proceeding as sole bidder",
-                msg.channel,
-                msg.chat_id,
+            verify_timeout = min(1.5, negotiation_timeout * 0.25)
+            late_bids, late_claim = await self._collect_negotiation_bids(
+                pending_queue, timeout=verify_timeout
             )
-            return True
+            if late_claim:
+                logger.info(
+                    "Late claim detected for {}:{}; deferring",
+                    msg.channel,
+                    msg.chat_id,
+                )
+                await self._post_coordination_selection(
+                    msg, selected=False, reason="another bot claimed during verification"
+                )
+                return False
+            if late_bids:
+                other_bids = late_bids
+                # Fall through to multi-bid evaluation below
+            else:
+                logger.info(
+                    "No other bids received for {}:{}; proceeding as sole bidder",
+                    msg.channel,
+                    msg.chat_id,
+                )
+                return True
 
         # Phase 4: Notify user that bids are being evaluated
         bid_count = len(other_bids) + 1  # include self

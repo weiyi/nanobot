@@ -3626,31 +3626,35 @@ async def test_negotiation_defers_when_claim_detected_during_collection(tmp_path
     )
 
     async def _feed_claim():
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.05)
         await pending.put(claim_msg)
 
     feed_task = asyncio.create_task(_feed_claim())
 
-    result = await loop._process_message(
-        InboundMessage(
-            channel="slack",
-            sender_id="U1",
-            chat_id="C1",
-            content="check the deployment status",
-            metadata={
-                "slack": {
-                    "channel_type": "channel",
-                    "thread_ts": "1700000000.000100",
-                    "group_policy": "smart",
-                    "smart_enabled": True,
-                    "was_directly_mentioned": False,
-                    "smart_confidence_threshold": 0.7,
-                    "negotiation_timeout": 0.2,
-                }
-            },
-        ),
-        pending_queue=pending,
-    )
+    # Patch jitter to 0 so the claim is always detected during collection,
+    # not during the pre-bid early drain.
+    with patch("nanobot.agent.loop.random") as mock_random:
+        mock_random.uniform.return_value = 0.0
+        result = await loop._process_message(
+            InboundMessage(
+                channel="slack",
+                sender_id="U1",
+                chat_id="C1",
+                content="check the deployment status",
+                metadata={
+                    "slack": {
+                        "channel_type": "channel",
+                        "thread_ts": "1700000000.000100",
+                        "group_policy": "smart",
+                        "smart_enabled": True,
+                        "was_directly_mentioned": False,
+                        "smart_confidence_threshold": 0.7,
+                        "negotiation_timeout": 0.2,
+                    }
+                },
+            ),
+            pending_queue=pending,
+        )
 
     await feed_task
 
