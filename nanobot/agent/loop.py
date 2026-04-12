@@ -360,7 +360,7 @@ class AgentLoop:
 
     @staticmethod
     def _looks_like_action_request(text: str | None) -> bool:
-        """Heuristic: imperative or ask-style messages should bias toward replying."""
+        """Heuristic: imperative, ask-style, or open-question messages should bias toward replying."""
         cleaned = " ".join((text or "").strip().split())
         if not cleaned:
             return False
@@ -377,7 +377,18 @@ class AgentLoop:
         if lowered.startswith(prefixes):
             return True
 
-        return bool(re.match(r"^(?:hey\s+|hi\s+)?(?:bot\s+)?(?:can|could|would|will)\s+you\b", lowered))
+        if re.match(r"^(?:hey\s+|hi\s+)?(?:bot\s+)?(?:can|could|would|will)\s+you\b", lowered):
+            return True
+
+        # Open questions: what/how/why/where/when/who followed by a word (not just "what?" alone).
+        if re.match(r"^(?:hey\s+|hi\s+)?(?:what|how|why|where|when|who|which)\s+\w", lowered):
+            return True
+
+        # Questions ending with '?' that contain question words anywhere.
+        if cleaned.endswith("?") and re.search(r"\b(?:what|how|why|where|when|who|which)\b", lowered):
+            return True
+
+        return False
 
     @classmethod
     def _parse_reply_gate_decision(cls, content: str | None) -> tuple[bool, float, str]:
@@ -463,8 +474,12 @@ class AgentLoop:
                     "You are a reply arbiter for one Slack bot in a shared channel with humans and other bots. "
                     "Decide whether THIS bot should reply to the newest message. "
                     "Mentions always reply=true, but this request is only for non-mentioned messages. "
-                    "Reply true only if the message clearly needs this bot, continues an active exchange this bot is already in, "
+                    "Reply true if the message clearly needs this bot, continues an active exchange this bot is already in, "
                     "or specifically benefits from this bot's capabilities. "
+                    "IMPORTANT: Open questions or requests from a human that are NOT clearly directed at "
+                    "another specific bot should return true — at least one bot must pick up the conversation. "
+                    "Only return false when the thread history makes it obvious the user is in an ongoing "
+                    "conversation with a different bot, or when the message is pure chatter with no question or request. "
                     "NEGOTIATION PROTOCOL: When multiple bots share a channel, bots discuss openly "
                     "to decide who is best suited for the task. Each interested bot posts a capability bid "
                     "(📋 I could help with this — [reason]) and after a short deliberation window the bots "
@@ -474,7 +489,6 @@ class AgentLoop:
                     "return false — defer to that bot and do not duplicate the response. "
                     "Your 'reason' field should briefly describe THIS bot's relevant capabilities "
                     "for the request — this reason is used as the capability bid in the negotiation. "
-                    "If unsure, choose false. "
                     "Return strict JSON only: "
                     '{"should_reply": true|false, "confidence": 0.0, "reason": "short capability description"}.'
                 ),
