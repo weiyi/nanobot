@@ -568,7 +568,8 @@ Uses **WebSocket** long connection — no public IP required.
       "reactEmoji": "OnIt",
       "doneEmoji": "DONE",
       "toolHintPrefix": "🔧",
-      "streaming": true
+      "streaming": true,
+      "domain": "feishu"
     }
   }
 }
@@ -581,6 +582,7 @@ Uses **WebSocket** long connection — no public IP required.
 > `reactEmoji`: Emoji for "processing" status (default: `OnIt`). See [available emojis](https://open.larkoffice.com/document/server-docs/im-v1/message-reaction/emojis-introduce).
 > `doneEmoji`: Optional emoji for "completed" status (e.g., `DONE`, `OK`, `HEART`). When set, bot adds this reaction after removing `reactEmoji`.
 > `toolHintPrefix`: Prefix for inline tool hints in streaming cards (default: `🔧`).
+> `domain`: `"feishu"` (default) for China (open.feishu.cn), `"lark"` for international Lark (open.larksuite.com).
 
 **3. Run**
 
@@ -1062,6 +1064,30 @@ Connects directly to any OpenAI-compatible endpoint — LM Studio, llama.cpp, To
 ```
 
 > For local servers that don't require a key, set `apiKey` to any non-empty string (e.g. `"no-key"`).
+>
+> `custom` is the right choice for providers that expose an OpenAI-compatible **chat completions** API. It does **not** force third-party endpoints onto the OpenAI/Azure **Responses API**.
+>
+> If your proxy or gateway is specifically Responses-API-compatible, use the `azure_openai` provider shape instead and point `apiBase` at that endpoint:
+>
+> ```json
+> {
+>   "providers": {
+>     "azure_openai": {
+>       "apiKey": "your-api-key",
+>       "apiBase": "https://api.your-provider.com",
+>       "defaultModel": "your-model-name"
+>     }
+>   },
+>   "agents": {
+>     "defaults": {
+>       "provider": "azure_openai",
+>       "model": "your-model-name"
+>     }
+>   }
+> }
+> ```
+>
+> In short: **chat-completions-compatible endpoint → `custom`**; **Responses-compatible endpoint → `azure_openai`**.
 
 </details>
 
@@ -1606,6 +1632,26 @@ When enabled, all incoming messages — regardless of which channel they arrive 
 
 > This is designed for single-user, multi-device setups. It is **off by default** — existing users see zero behavior change.
 
+### Disabled Skills
+
+nanobot ships with built-in skills, and your workspace can also define custom skills under `skills/`. If you want to hide specific skills from the agent, set `agents.defaults.disabledSkills` to a list of skill directory names:
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "disabledSkills": ["github", "weather"]
+    }
+  }
+}
+```
+
+Disabled skills are excluded from the main agent's skill summary, from always-on skill injection, and from subagent skill summaries. This is useful when some bundled skills are unnecessary for your deployment or should not be exposed to end users.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `agents.defaults.disabledSkills` | `[]` | List of skill directory names to exclude from loading. Applies to both built-in skills and workspace skills. |
+
 ## 🧩 Multiple Instances
 
 Run multiple nanobot instances simultaneously with separate configs and runtime data. Use `--config` as the main entrypoint. Optionally pass `--workspace` during `onboard` when you want to initialize or update the saved workspace for a specific instance.
@@ -1731,6 +1777,7 @@ time.
 
 - `memory/history.jsonl` stores append-only summarized history
 - `SOUL.md`, `USER.md`, and `memory/MEMORY.md` store long-term knowledge managed by Dream
+- `Dream` can also promote repeated workflows into reusable workspace skills under `skills/`
 - `Dream` runs on a schedule and can also be triggered manually
 - memory changes can be inspected and restored with built-in commands
 
@@ -1846,6 +1893,19 @@ By default, the API binds to `127.0.0.1:8900`. You can change this in `config.js
 - Single-message input: each request must contain exactly one `user` message
 - Fixed model: omit `model`, or pass the same model shown by `/v1/models`
 - No streaming: `stream=true` is not supported
+- API requests run in the synthetic `api` channel, so the `message` tool does **not** automatically deliver to Telegram/Discord/etc. To proactively send to another chat, call `message` with an explicit `channel` and `chat_id` for an enabled channel.
+
+Example tool call for cross-channel delivery from an API session:
+
+```json
+{
+  "content": "Build finished successfully.",
+  "channel": "telegram",
+  "chat_id": "123456789"
+}
+```
+
+If `channel` points to a channel that is not enabled in your config, nanobot will queue the outbound event but no platform delivery will occur.
 
 ### Endpoints
 
